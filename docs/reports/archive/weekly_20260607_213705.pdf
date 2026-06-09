@@ -1,0 +1,79 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 3038 >>
+stream
+q
+BT /F1 18 Tf 50 774 Td (????) Tj ET
+Q
+BT /F1 14 Tf 50 748 Td (? ???? ∑ 2026-06-07) Tj ET
+BT /F1 14 Tf 50 717 Td (??) Tj ET
+BT /F1 10 Tf 50 692 Td (<think> The user is asking me to write a weekly review for a quantitative stock selec) Tj ET
+BT /F1 10 Tf 50 678 Td (tion agent. However, all the data provided is empty/zero: - ???: 0 - ??: 0% - ?? PnL:) Tj ET
+BT /F1 10 Tf 50 664 Td ( 0% - ?????: {} - ?????: {} - ????: [] - ????: []) Tj ET
+BT /F1 10 Tf 50 639 Td (There is literally no data to analyze. I should be honest about this rather than fabr) Tj ET
+BT /F1 10 Tf 50 625 Td (icating insights. The user explicitly said "??????" \(no other nonsense\), so I should ) Tj ET
+BT /F1 10 Tf 50 611 Td (be direct.) Tj ET
+BT /F1 10 Tf 50 586 Td (I need to think about whether I should: 1. Point out the data is empty and can't gene) Tj ET
+BT /F1 10 Tf 50 572 Td (rate meaningful analysis 2. Just output the requested format with appropriate "no dat) Tj ET
+BT /F1 10 Tf 50 558 Td (a" content) Tj ET
+BT /F1 10 Tf 50 533 Td (Given the instruction "??????", I think the best approach is to briefly note that the) Tj ET
+BT /F1 10 Tf 50 519 Td (re's no data to analyze, while still respecting the format. But the format is strict.) Tj ET
+BT /F1 10 Tf 50 505 Td ( Let me think...) Tj ET
+BT /F1 10 Tf 50 480 Td (Actually, the most honest and useful response is to tell the user that with zero samp) Tj ET
+BT /F1 10 Tf 50 466 Td (les and all empty fields, there's no meaningful analysis possible. Making up insights) Tj ET
+BT /F1 10 Tf 50 452 Td ( from empty data would be the opposite of what a quant agent should do.) Tj ET
+BT /F1 10 Tf 50 427 Td (Let me write this concisely. </think> ????????????????????????????) Tj ET
+BT /F1 10 Tf 50 402 Td (?3 ????? ??????????/??????????????????? PnL??????????????????????????????????????????) Tj ET
+BT /F1 10 Tf 50 388 Td (??) Tj ET
+BT /F1 10 Tf 50 363 Td (???? ????????????"????"??????????????????????filter ????????????/????????????????????) Tj ET
+BT /F1 10 Tf 50 349 Td (??????????=0 ?????????????????"????"??") Tj ET
+BT /F1 14 Tf 50 320 Td (????) Tj ET
+BT /F2 10 Tf 50 295 Td (?? | ?) Tj ET
+BT /F2 10 Tf 50 281 Td (??? | 0) Tj ET
+BT /F2 10 Tf 50 267 Td (?? | 0.00%) Tj ET
+BT /F2 10 Tf 50 253 Td (?? PnL | 0.00%) Tj ET
+BT /F1 14 Tf 50 224 Td (????) Tj ET
+BT /F1 10 Tf 50 199 Td (???????) Tj ET
+BT /F1 14 Tf 50 170 Td (???????) Tj ET
+BT /F1 10 Tf 50 145 Td (??: 12 ????) Tj ET
+BT /F2 10 Tf 50 120 Td (?? | ? PnL | ?? | Sharpe | Sortino | ???? | ?? | ???? | ???) Tj ET
+BT /F2 10 Tf 50 106 Td (fixed_A | 5.24% | 8.30% | 1.70 | 4.38 | 30.71% | 177.93% | 1 | 1.75) Tj ET
+BT /F2 10 Tf 50 92 Td (fixed_B | 5.24% | 8.30% | 1.70 | 4.38 | 30.71% | 177.93% | 1 | 1.75) Tj ET
+BT /F2 10 Tf 50 78 Td (auto | 5.24% | 8.30% | 1.70 | 4.38 | 30.71% | 177.93% | 1 | 1.75) Tj ET
+BT /F2 10 Tf 50 64 Td (fixed_C | 0.00% | 0.00% | 0.00 | -15.49 | 0.00% | 0.00% | 0 | 0.00) Tj ET
+BT /F1 10 Tf ET
+
+BT /F1 10 Tf 50 782 Td (**??: fixed_A** \(? Sharpe ???\)) Tj ET
+BT /F1 10 Tf 50 750 Td (--- _????: 2026-06-07T21:37:05.350826_) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000257 00000 n 
+0000003347 00000 n 
+0000003417 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+3485
+%%EOF

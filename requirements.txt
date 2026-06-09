@@ -1,0 +1,18 @@
+# Stock Trading Agent runtime dependencies
+# Install:  .venv/bin/pip install -r requirements.txt
+# Recreate venv (one-time):
+#   python3 -m venv .venv --system-site-packages
+#
+# lark-oapi  —— 飞书 WebSocket listener (v10+)
+# requests   —— 飞书 / 多维表格 webhook 投递
+# jinja2     —— 周报 / follow-up 模板
+# cryptography—— Fernet 加密 config
+# pyyaml     —— YAML config (load_config 缺它会自动降级到 JSON)
+# apscheduler—— `agent daemon` cron / `daemon --catch-up` 必需
+
+lark-oapi>=1.6,<2.0
+requests>=2.31
+jinja2>=3.1
+cryptography>=41.0
+pyyaml>=6.0
+apscheduler>=3.10

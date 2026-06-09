@@ -1,0 +1,33 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+
+# Runtime state
+data/quant.db
+data/quant.db-journal
+data/picks_legacy/**
+!data/picks_legacy/.gitkeep
+
+# Local env
+.env
+.env.local
+*.local.yaml
+
+# ─── 付费知识库源 (v12.5: 不上传 GitHub, 来源: IMA/公众号, 属于个人整理资源) ───
+# haoyun: 好运2008 (淘股吧 6630) 227 篇帖子提炼
+stock_trading_agent/data/knowledge/haoyun_wisdom.md
+# susan: 苏三离了家 49 篇 A 股点评
+stock_trading_agent/data/knowledge/susan_all.json
+# chanlun: 缠中说禅 108 课 (来自 IMA 知识库, "至今配图最全"版)
+stock_trading_agent/data/knowledge/chanlun/**
+# 但 .gitkeep 保留, 让 chanlun/ 目录结构跟仓库一起走
+!stock_trading_agent/data/knowledge/chanlun/.gitkeep
+# stock_synonyms.json 留着 (项目自带, 不算隐私)
+
+# IDE
+.idea/
+.vscode/
+.DS_Store

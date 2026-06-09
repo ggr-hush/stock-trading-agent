@@ -1,0 +1,181 @@
+# stock_trading_agent — 策略参数 + 调参安全范围
+# 所有阈值都在这里，调参只动这个文件，不动源码
+# 修改后下次运行 pick() 时自动生效（无热加载，但每阶段启动重读）
+
+# ─── 硬阈值（v1 不可自动改）───
+hard:
+  chg_danger: 4.8         # 涨幅危险线（≥4.8% 主力出货嫌疑）
+  amp_danger: 8.0         # 振幅危险线（≥8% 主力出货嫌疑）
+  chg_over: 6.0           # 超涨警戒线（>6% 次日回调风险大）
+  limit_up: 9.8           # 涨停线
+  mv_lo_yi: 50            # 市值下限（亿）
+  mv_hi_yi: 5000          # 市值上限（亿）
+  amt_lo_yi: 3            # 成交额下限（亿）
+  max_picks: 15           # 最多推送只数
+
+# ─── 方案 A（精准）───
+plan_a:
+  chg_lo: 3.0
+  chg_hi: 4.0
+  turnover_lo: 8.0        # 换手率下限
+  turnover_hi: 10.0
+  amplitude_hi: 8.0       # 振幅上限
+
+# ─── 方案 B（平衡）───
+plan_b:
+  chg_lo: 3.0
+  chg_hi: 4.0
+  turnover_lo: 6.0
+  turnover_hi: 10.0
+  amplitude_hi: 8.0
+
+# ─── v3 调参（2026-06-06 深度复盘后落地）───
+# 调参引擎 tuner.py 只能动 safe_range 内的值，超出推飞书确认卡片
+v3:
+  score_max:                    # 评分上限，>= 视为超涨高位票剔除
+    value: 80.0
+    safe_range: [75.0, 85.0]
+  strong_band_lo:               # 强信号带下沿（选股日涨幅区间起点）
+    value: 3.0
+    safe_range: [2.8, 3.2]
+  strong_band_hi:               # 强信号带上沿
+    value: 3.5
+    safe_range: [3.3, 3.7]
+  strong_bonus:                 # 强信号带加分
+    value: 5
+    safe_range: [3, 8]
+  theme_bonus:                  # 主线板块个股加分
+    value: 3
+    safe_range: [2, 5]
+
+# ─── 板块黑名单（v3 反向指标：胜率 < 35% 的拖累板块）───
+blacklist:
+  sectors:
+    - 光伏设备
+    - 电子化学品Ⅱ
+    - 通用设备
+    - 塑料
+    - 消费电子
+    - 电池
+    - 软件开发
+  max_add_per_week: 2           # 单次自动调参最多新增
+  max_remove_per_week: 2        # 单次自动调参最多移除
+  safe_sectors: []              # 永远不删的板块
+
+# ─── 大盘环境（苏三框架）───
+env:
+  indices:
+    - { code: sh000001, name: 上证指数, weight: 0.40 }
+    - { code: sz399006, name: 创业板指, weight: 0.35 }
+    - { code: sh000688, name: 科创50,  weight: 0.25 }
+  vol_thresh_hi_yi: 12000       # 放量标准
+  vol_thresh_lo_yi: 9000        # 温和放量
+
+# ─── 仓位决策（基于 env_score + 主线数量）───
+position:
+  full: { score_min: 75, ratio: 1.0, advice: "满仓100%", market: 牛市 }
+  heavy: { score_min: 60, ratio: 0.8, advice: "重仓80%", market: 牛市 }
+  half: { score_min: 45, ratio: 0.5, advice: "半仓50%", market: 震荡 }
+  light: { score_min: 30, ratio: 0.2, advice: "轻仓20%", market: 震荡 }
+  empty: { score_min: 0,  ratio: 0.0, advice: "空仓0%", market: 熊市 }
+
+# v9.4: LLM-as-judge 调参评估 (双 LLM 互锁)
+tuner:
+  judge_enabled: false
+  judge_min_score: 60
+
+# ─── Paper-trade 引擎 ───
+paper:
+  initial_capital: 1000000.0   # 初始资金 100 万
+  max_position_ratio: 0.20     # 单只仓位上限 20%
+  max_concurrent: 3            # 同时持仓最多 3 只
+  max_sector_ratio: 0.50       # 同一板块总仓位不超过 50% (行业集中度)
+  max_sector_concurrent: 2     # 同一板块最多同时持仓 2 只
+
+# v9.2: 多账户 paper trade 横向对比 (dry-run, 不真开仓)
+multi_account:
+  enabled: false               # 开启后, 选股卡片会列出 3 个 profile 的对比
+  profiles:
+    conservative:
+      max_concurrent: 2
+      max_position_ratio: 0.15
+      max_sector_concurrent: 1
+      max_sector_ratio: 0.30
+    balanced:
+      max_concurrent: 3
+      max_position_ratio: 0.20
+      max_sector_concurrent: 2
+      max_sector_ratio: 0.50
+    aggressive:
+      max_concurrent: 4
+      max_position_ratio: 0.30
+      max_sector_concurrent: 3
+      max_sector_ratio: 0.70
+
+# v9.3: 实时盯盘
+intraday_monitor:
+  enabled: true              # 关闭后, 调度不报错但 stage 不做事
+  chg_threshold: 3.0         # 涨/跌 > 3% 触发告警
+  amplitude_threshold: 8.0   # 振幅 > 8% 触发告警
+  # v7.2: 板块相关性矩阵 (防因子集中)
+  # group 内板块视为高相关, 总仓位不能超 correlated_group_max_ratio
+  correlated_group_max_ratio: 0.60   # 任一相关性 group 总仓位上限
+  auto_learn_correlated_groups: false  # v8.1: 开启后用历史 pnl 自动学 group, 忽略下方硬编码
+  correlation_window_days: 60          # v8.1: 学习窗口
+  correlation_threshold: 0.7           # v8.1: 相关性阈值, > 此值合并到同一 group
+  correlated_sector_groups:
+    - ["新能源车", "锂电池", "充电桩"]
+    - ["半导体", "芯片", "光刻机"]
+    - ["光伏", "储能", "风电"]
+    - ["银行", "保险", "证券"]
+    - ["医药", "医疗器械", "生物制药"]
+    - ["白酒", "食品饮料", "消费"]
+
+# ─── 调度（APScheduler cron 表达式）───
+schedule:
+  pre_market:    "30 8 * * 1-5"    # 盘前复盘
+  open_auction:  "15 9 * * 1-5"    # 集合竞价风控
+  pick:          "0 14 * * 1-5"    # 尾盘选股
+  post_market:   "30 15 * * 1-5"   # 盘后对账
+  evening:       "0 19 * * 1-5"    # 晚间日报
+  weekly_review: "0 20 * * 0"      # 周日深度复盘 + 调参 + 落盘 + 推飞书
+  weekly_auto_backtest_days: 30  # v7.3: 周日 stage 自动跑回测的天数窗口; 0=不跑回测
+  intraday_monitor: "*/5 9-15 * * 1-5"  # v9.3: 盘中每 5 分钟扫持仓股, 异动推飞书
+  # v12: 轻主动推送 (跟 stage 平级, 独立 PUSH_REGISTRY)
+  daily_summary_push: "35 15 * * 1-5"   # 收盘后 15:35 推日报卡片 (paper PnL + 持仓)
+  anomaly_recap_push: "5 19 * * 1-5"    # 晚间 19:05 推当日异动复盘 (盘中监控)
+
+# ─── 数据源 ───
+data_source:
+  eastmoney_base: https://push2delay.eastmoney.com
+  sina_kline: https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData
+  tencent_quote: https://qt.gtimg.cn
+  tencent_kline: https://web.ifzq.gtimg.cn/appstock/app/fqkline/get
+
+# ─── 飞书群聊白名单 (空 = 全部允许) ───
+feishu:
+  whitelist_mode: "off"          # "off" = 全部允许; "whitelist" = 只在白名单内才回复; "blacklist" = 黑名单内不回复
+  whitelist_chat_ids: []         # 群 chat_id 列表 (oc_xxx)
+  blacklist_chat_ids: []         # 黑名单
+  allowed_user_ids: []           # 可选: 只允许这些 open_id (ou_xxx) 触发
+  admin_user_ids: []             # 管理员 (可触发 /reset 等管理指令)
+
+# ─── Session 加密 ───
+session:
+  encryption: "off"              # "off" = 明文; "fernet" = Fernet 加密 (需要 BOT_ENCRYPTION_KEY env)
+  encryption_key_env: BOT_ENCRYPTION_KEY
+  max_history_turns: 20          # 单 session 最大轮数
+  ttl_hours: 24                  # 不活跃多少小时后清空
+
+# ─── 回测 ───
+backtest:
+  risk_free_rate_pct: 2.0        # 年化无风险利率 (用于 Sharpe)
+  trading_days_per_year: 240     # A 股年交易日
+
+# ─── LLM（minimax M3）───
+llm:
+  api_base: https://api.minimax.chat/v1
+  model: MiniMax-M3
+  api_key_env: MINIMAX_API_KEY
+  timeout_s: 30
+  max_retries: 2

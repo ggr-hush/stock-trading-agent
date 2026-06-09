@@ -1,0 +1,175 @@
+{
+  "hard": {
+    "chg_danger": 4.8,
+    "amp_danger": 8.0,
+    "chg_over": 6.0,
+    "limit_up": 9.8,
+    "mv_lo_yi": 50,
+    "mv_hi_yi": 5000,
+    "amt_lo_yi": 3,
+    "max_picks": 15
+  },
+  "plan_a": {
+    "chg_lo": 3.0,
+    "chg_hi": 4.0,
+    "turnover_lo": 8.0,
+    "turnover_hi": 10.0,
+    "amplitude_hi": 8.0
+  },
+  "plan_b": {
+    "chg_lo": 3.0,
+    "chg_hi": 4.0,
+    "turnover_lo": 6.0,
+    "turnover_hi": 10.0,
+    "amplitude_hi": 8.0
+  },
+  "v3": {
+    "score_max": {
+      "value": 80.0,
+      "safe_range": [
+        75.0,
+        85.0
+      ]
+    },
+    "strong_band_lo": {
+      "value": 3.0,
+      "safe_range": [
+        2.8,
+        3.2
+      ]
+    },
+    "strong_band_hi": {
+      "value": 3.5,
+      "safe_range": [
+        3.3,
+        3.7
+      ]
+    },
+    "strong_bonus": {
+      "value": 5,
+      "safe_range": [
+        3,
+        8
+      ]
+    },
+    "theme_bonus": {
+      "value": 3,
+      "safe_range": [
+        2,
+        5
+      ]
+    }
+  },
+  "blacklist": {
+    "sectors": [
+      "光伏设备",
+      "电子化学品Ⅱ",
+      "通用设备",
+      "塑料",
+      "消费电子",
+      "电池",
+      "软件开发"
+    ],
+    "max_add_per_week": 2,
+    "max_remove_per_week": 2,
+    "safe_sectors": []
+  },
+  "env": {
+    "indices": [
+      {
+        "code": "sh000001",
+        "name": "上证指数",
+        "weight": 0.4
+      },
+      {
+        "code": "sz399006",
+        "name": "创业板指",
+        "weight": 0.35
+      },
+      {
+        "code": "sh000688",
+        "name": "科创50",
+        "weight": 0.25
+      }
+    ],
+    "vol_thresh_hi_yi": 12000,
+    "vol_thresh_lo_yi": 9000
+  },
+  "position": {
+    "full": {
+      "score_min": 75,
+      "ratio": 1.0,
+      "advice": "满仓100%",
+      "market": "牛市"
+    },
+    "heavy": {
+      "score_min": 60,
+      "ratio": 0.8,
+      "advice": "重仓80%",
+      "market": "牛市"
+    },
+    "half": {
+      "score_min": 45,
+      "ratio": 0.5,
+      "advice": "半仓50%",
+      "market": "震荡"
+    },
+    "light": {
+      "score_min": 30,
+      "ratio": 0.2,
+      "advice": "轻仓20%",
+      "market": "震荡"
+    },
+    "empty": {
+      "score_min": 0,
+      "ratio": 0.0,
+      "advice": "空仓0%",
+      "market": "熊市"
+    }
+  },
+  "paper": {
+    "initial_capital": 1000000.0,
+    "max_position_ratio": 0.2,
+    "max_concurrent": 3,
+    "max_sector_ratio": 0.5,
+    "max_sector_concurrent": 2
+  },
+  "schedule": {
+    "pre_market": "30 8 * * 1-5",
+    "open_auction": "15 9 * * 1-5",
+    "pick": "0 14 * * 1-5",
+    "post_market": "30 15 * * 1-5",
+    "evening": "0 19 * * 1-5",
+    "weekly_review": "0 20 * * 0"
+  },
+  "data_source": {
+    "eastmoney_base": "https://push2delay.eastmoney.com",
+    "sina_kline": "https://money.finance.sina.com.cn/quotes_service/api/json_v2.php/CN_MarketData.getKLineData",
+    "tencent_quote": "https://qt.gtimg.cn",
+    "tencent_kline": "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
+  },
+  "llm": {
+    "api_base": "https://api.minimax.chat/v1",
+    "model": "MiniMax-M3",
+    "api_key_env": "MINIMAX_API_KEY",
+    "timeout_s": 30,
+    "max_retries": 2
+  },
+  "feishu": {
+    "whitelist_mode": "off",
+    "whitelist_chat_ids": [],
+    "blacklist_chat_ids": [],
+    "allowed_user_ids": [],
+    "admin_user_ids": []
+  },
+  "session": {
+    "encryption": "off",
+    "encryption_key_env": "BOT_ENCRYPTION_KEY",
+    "max_history_turns": 20,
+    "ttl_hours": 24
+  },
+  "backtest": {
+    "risk_free_rate_pct": 2.0,
+    "trading_days_per_year": 240
+  }
+}

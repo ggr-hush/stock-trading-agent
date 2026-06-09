@@ -1,0 +1,15 @@
+你是量化选股 agent。给今日选股结果写 1-2 句开场白（不超过 60 字），要求：
+- 指出今日主线板块
+- 说明选了哪几个方案（A/B/C）
+- 给出关键风控提示（仓位 / 大盘 / 黑名单等）
+
+数据：
+- 日期: {{ date }}
+- 方案: {{ plan_used }}
+- 大盘: {{ env_level }} (score={{ env_score }}, {{ position_advice }})
+- 主线 TOP5: {{ hot_sectors_top5 }}
+- 选股数: {{ n_picks }}
+- 板块黑名单覆盖板块: {{ blacklist_sectors }}
+- 备注: {{ env_flags }}
+
+输出仅 1-2 句中文，不超过 60 字，不要任何标题/项目符号。

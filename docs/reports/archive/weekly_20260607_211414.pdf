@@ -1,0 +1,65 @@
+%PDF-1.4
+%‚„œ”
+1 0 obj
+<< /Type /Catalog /Pages 2 0 R >>
+endobj
+2 0 obj
+<< /Type /Pages /Kids [3 0 R] /Count 1 >>
+endobj
+3 0 obj
+<< /Type /Page /Parent 2 0 R /MediaBox [0 0 595 842] /Resources << /Font << /F1 5 0 R /F2 6 0 R >> >> /Contents 4 0 R >>
+endobj
+4 0 obj
+<< /Length 1528 >>
+stream
+q
+BT /F1 18 Tf 50 774 Td (????) Tj ET
+Q
+BT /F1 14 Tf 50 748 Td (? ???? ∑ 2026-06-07) Tj ET
+BT /F1 14 Tf 50 717 Td (????) Tj ET
+BT /F2 10 Tf 50 692 Td (?? | ?) Tj ET
+BT /F2 10 Tf 50 678 Td (??? | 1) Tj ET
+BT /F2 10 Tf 50 664 Td (?? | 100.00%) Tj ET
+BT /F2 10 Tf 50 650 Td (?? PnL | 0.80%) Tj ET
+BT /F1 12 Tf 50 625 Td (?????) Tj ET
+BT /F2 10 Tf 50 600 Td (???? | ?? | ?? PnL | ??) Tj ET
+BT /F2 10 Tf 50 586 Td (>=80 | 1 | 0.80% | 100.00%) Tj ET
+BT /F1 12 Tf 50 561 Td (????????) Tj ET
+BT /F2 10 Tf 50 536 Td (???? | ?? | ?? PnL | ??) Tj ET
+BT /F2 10 Tf 50 522 Td (<3.0 | 1 | 0.80% | 100.00%) Tj ET
+BT /F1 12 Tf 50 497 Td (???? \(? PnL ??\)) Tj ET
+BT /F2 10 Tf 50 472 Td (?? | ?? | ?? PnL | ??) Tj ET
+BT /F2 10 Tf 50 458 Td (?? | 1 | 0.80% | 100.00%) Tj ET
+BT /F1 14 Tf 50 429 Td (????) Tj ET
+BT /F1 10 Tf 50 404 Td (???????) Tj ET
+BT /F1 14 Tf 50 375 Td (???????) Tj ET
+BT /F1 10 Tf 50 350 Td (??: 12 ????) Tj ET
+BT /F2 10 Tf 50 325 Td (?? | ? PnL | ?? | Sharpe | Sortino | ???? | ?? | ???? | ???) Tj ET
+BT /F2 10 Tf 50 311 Td (fixed_A | 5.24% | 8.30% | 1.70 | 4.38 | 30.71% | 177.93% | 1 | 1.75) Tj ET
+BT /F2 10 Tf 50 297 Td (fixed_B | 5.24% | 8.30% | 1.70 | 4.38 | 30.71% | 177.93% | 1 | 1.75) Tj ET
+BT /F2 10 Tf 50 283 Td (auto | 5.24% | 8.30% | 1.70 | 4.38 | 30.71% | 177.93% | 1 | 1.75) Tj ET
+BT /F2 10 Tf 50 269 Td (fixed_C | 0.00% | 0.00% | 0.00 | -15.49 | 0.00% | 0.00% | 0 | 0.00) Tj ET
+BT /F1 10 Tf 50 244 Td (**??: fixed_A** \(? Sharpe ???\)) Tj ET
+BT /F1 10 Tf 50 212 Td (--- _????: 2026-06-07T21:14:14.345460_) Tj ET
+endstream
+endobj
+5 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Helvetica >>
+endobj
+6 0 obj
+<< /Type /Font /Subtype /Type1 /BaseFont /Courier >>
+endobj
+xref
+0 7
+0000000000 65535 f 
+0000000015 00000 n 
+0000000064 00000 n 
+0000000121 00000 n 
+0000000257 00000 n 
+0000001837 00000 n 
+0000001907 00000 n 
+trailer
+<< /Size 7 /Root 1 0 R >>
+startxref
+1975
+%%EOF
