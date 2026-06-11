@@ -12,11 +12,45 @@ import logging
 import re
 import signal
 import sys
+import threading
+import time
 from typing import Any
 
 log = logging.getLogger("feishu.listener")
 
 EVENT_KEY = "im.message.receive_v1"
+
+# ────────── 消息去重缓存 (v12.5.1) ──────────
+# 根因: lark-oapi 5xx / WebSocket reconnect 会重投同 message_id 的事件
+# 解决: 模块级 LRU + TTL 10min, 覆盖飞书 5xx 重投 + 16min 断线回放窗口
+_DEDUP_TTL_S = 600
+_DEDUP_MAX = 2000
+_seen_msgs: dict = {}
+_seen_lock = threading.Lock()
+
+
+def _mark_seen(message_id: str) -> bool:
+    """返回 True 表示新消息应处理, False 表示重复应跳过"""
+    # 线程安全: lark-oapi 内部 asyncio 事件循环, 但 ws 重连期间
+    # on_message 可能并发调起, 加锁保险。
+    now = time.time()
+    with _seen_lock:
+        if len(_seen_msgs) > _DEDUP_MAX:
+            cutoff = now - _DEDUP_TTL_S
+            for mid in [k for k, t in list(_seen_msgs.items()) if t < cutoff]:
+                _seen_msgs.pop(mid, None)
+        if message_id in _seen_msgs:
+            return False
+        _seen_msgs[message_id] = now
+        if len(_seen_msgs) > _DEDUP_MAX:
+            try:
+                oldest = min(_seen_msgs, key=_seen_msgs.get)
+                _seen_msgs.pop(oldest, None)
+            except ValueError:
+                pass
+        return True
+
+
 
 
 # ─────────── 文本提取 / mention 处理 ───────────
@@ -95,7 +129,8 @@ def _send_reply(client, chat_id: str, text: str) -> dict[str, Any]:
             return {"ok": False, "error": f"code={resp.code} msg={resp.msg}"}
         return {"ok": True, "message_id": resp.data.message_id}
     except Exception as e:
-        return {"ok": False, "error": str(e)}
+        log.warning("_send_reply 失败: %s: %s", type(e).__name__, str(e)[:200])
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}"}
 
 
 # ─────────── 兼容层: 旧 lark-cli 风格 _handle_event (test_v3 用) ───────────
@@ -183,6 +218,11 @@ def _make_handler(client, get_config):
             sender_id = (sid.open_id or sid.user_id or sid.union_id or "")
 
         if not text or not chat_id or not message_id:
+            return
+
+        # v12.5.1: message_id 去重 (lark-oapi 5xx / reconnect 重投同一事件)
+        if not _mark_seen(message_id):
+            log.info("dup skip msg=%s text=%r", message_id, text[:60])
             return
 
         cfg = get_config() or {}

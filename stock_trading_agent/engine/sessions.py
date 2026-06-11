@@ -7,6 +7,8 @@ sessions.py — Bot 多轮对话 session 记忆
 from __future__ import annotations
 
 import json
+import logging
+import os
 import sqlite3
 from datetime import datetime, timedelta
 from pathlib import Path
@@ -71,8 +73,6 @@ def _decrypt(blob: str) -> str:
         return blob  # 失败时回退明文 (兼容老数据)
 
 
-import os  # 上面用了 os.environ
-import logging
 log = logging.getLogger("engine.sessions")
 
 

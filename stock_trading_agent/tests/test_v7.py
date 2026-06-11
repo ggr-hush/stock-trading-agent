@@ -154,10 +154,10 @@ def test_stage_weekly_review_runs_full_report() -> None:
                    "auto_regression": {"triggered": False, "explanation": ""}}
     fake_bt = {"multi": {"fixed_A": {"pnl_pct": 0.5}, "fixed_B": {"pnl_pct": 0.3},
                          "auto": {"pnl_pct": 0.4}}}
-    with patch.object(ag, "run_weekly_review", return_value=fake_weekly), \
-         patch.object(ag, "backtest_multi", return_value=fake_bt) as bt_mp, \
-         patch.object(ag, "weekly_summary", return_value="LLM 总结"), \
-         patch.object(ag, "push_weekly_report", return_value={
+    with patch.object(ag.stages, "run_weekly_review", return_value=fake_weekly), \
+         patch.object(ag.stages, "backtest_multi", return_value=fake_bt) as bt_mp, \
+         patch.object(ag.stages, "weekly_summary", return_value="LLM 总结"), \
+         patch.object(ag.stages, "push_weekly_report", return_value={
              "saved": "docs/reports/weekly_2025-06-08.md",
              "feishu": {"ok": True, "channel": "app"},
          }) as push_mp:
@@ -180,11 +180,11 @@ def test_stage_weekly_review_skips_backtest_when_zero() -> None:
                    "applied": [], "pending": [],
                    "auto_regression": {"triggered": False, "explanation": ""}}
     fake_cfg = {"weekly_auto_backtest_days": 0, "schedule": {}}
-    with patch.object(ag, "load_config", return_value=fake_cfg), \
-         patch.object(ag, "run_weekly_review", return_value=fake_weekly), \
-         patch.object(ag, "backtest_multi") as bt_mp, \
-         patch.object(ag, "weekly_summary", return_value=""), \
-         patch.object(ag, "push_weekly_report", return_value={"saved": None, "feishu": {"ok": False}}):
+    with patch.object(ag.stages, "load_config", return_value=fake_cfg), \
+         patch.object(ag.stages, "run_weekly_review", return_value=fake_weekly), \
+         patch.object(ag.stages, "backtest_multi") as bt_mp, \
+         patch.object(ag.stages, "weekly_summary", return_value=""), \
+         patch.object(ag.stages, "push_weekly_report", return_value={"saved": None, "feishu": {"ok": False}}):
         stage_weekly_review()
     assert bt_mp.call_count == 0
     print("  ✓ test_stage_weekly_review_skips_backtest_when_zero")
@@ -479,7 +479,7 @@ def test_catch_up_picks_missing_cron_passed() -> None:
     }
     import stock_trading_agent.agent as ag
     fake_ran = []
-    with patch.object(ag, "load_config", return_value=fake_cfg), \
+    with patch.object(ag.stages, "load_config", return_value=fake_cfg), \
          patch.object(ag, "_dt") as dt_mod, \
          patch.object(ag, "was_stage_run_today", return_value=False), \
          patch.dict(ag.STAGE_REGISTRY, {}, clear=False):
@@ -585,8 +585,8 @@ def test_catch_up_picks_missing_cron_passed() -> None:
     try:
         # 真实环境可能没装 apscheduler, mock _cron_should_have_run 让其返回 True
         # (这样我们测的是"cron 已过"路径的 catch_up 逻辑, 不依赖 apscheduler)
-        with patch.object(ag, "load_config", return_value=fake_cfg), \
-             patch.object(ag, "_cron_should_have_run", return_value=True):
+        with patch.object(ag.stages, "load_config", return_value=fake_cfg), \
+             patch.object(ag.stages, "_cron_should_have_run", return_value=True):
             caught = catch_up_stages(now=fake_now)
         # 因为 mock 让所有 cron 都返回 True (假装所有 stage 都"该跑"了)
         # stage_runs 都空 → 6 个都补

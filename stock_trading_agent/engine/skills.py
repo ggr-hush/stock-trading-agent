@@ -164,25 +164,61 @@ def _render_daily_report_card(result: dict[str, Any]) -> dict[str, Any]:
 
 
 def _run_get_market_env(_args: dict[str, Any]) -> dict[str, Any]:
+    """v12.5.1: picks 表空时 (周末/假期) 实时拉一次大盘兜底
+
+    优先级: picks 表 (历史选股时算的 env) > data_fetcher 实时拉 > 失败提示
+    """
     conn = get_db()
     row = conn.execute(
         "SELECT market_env_score, market_env_level, pick_date FROM picks "
         "ORDER BY pick_date DESC, id DESC LIMIT 1"
     ).fetchone()
-    if not row:
-        return {"env_score": None, "env_level": None, "date": None}
-    return {
-        "env_score": row["market_env_score"],
-        "env_level": row["market_env_level"],
-        "date": row["pick_date"],
-    }
+    if row:
+        return {
+            "env_score": row["market_env_score"],
+            "env_level": row["market_env_level"],
+            "date": row["pick_date"],
+            "source": "picks",
+        }
+
+    # picks 空 (周末/假期/刚开项目) -> 实时拉一次
+    from datetime import date as _date
+    try:
+        from .data_fetcher import get_market_env as _fetch_env, load_config as _load_cfg
+        cfg = _load_cfg()
+        env = _fetch_env(cfg)
+        return {
+            "env_score": env.get("env_score"),
+            "env_level": env.get("env_level"),
+            "date": _date.today().isoformat(),
+            "source": "realtime",
+        }
+    except Exception as e:  # noqa: BLE001
+        log.warning("get_market_env 实时拉失败 (兜底): %s", e)
+        return {
+            "env_score": None,
+            "env_level": "数据源不可用",
+            "date": _date.today().isoformat(),
+            "source": "failed",
+        }
 
 
 def _render_market_env_card(result: dict[str, Any]) -> dict[str, Any]:
+    """v12.5.1: source 字段加标注, 失败给友好提示"""
+    src_label = result.get("source", "?")
+    src_emoji = {
+        "picks": "📊",      # 📊 选股时算的
+        "realtime": "⚡️",  # ⚡️ 刚拉的
+        "failed": "⚠️",    # ⚠️ 拉失败
+    }.get(src_label, "❓")
+    score = result.get("env_score")
+    score_str = f"{score}" if score is not None else "?"
+    level = result.get("env_level") or "?"
+    date_str = result.get("date") or "?"
     text = (
-        f"🌐 大盘 · {result.get('date', '?')}\n"
-        f"  env_score: {result.get('env_score', '?')}\n"
-        f"  env_level: {result.get('env_level', '?')}"
+        f"{src_emoji} 大盘 · {date_str} ({src_label})\n"
+        f"  env_score: {score_str}\n"
+        f"  env_level: {level}"
     )
     return {"msg_type": "text", "content": {"text": text}}
 

@@ -90,7 +90,7 @@ def test_cli_run_once_pick() -> None:
          patch("stock_trading_agent.engine.picker.get_stock_sectors", mock_get_stock_sectors), \
          patch("stock_trading_agent.engine.data_fetcher.get_sina_ut", mock_get_sina_ut), \
          patch("stock_trading_agent.engine.data_fetcher.is_trading_day", mock_is_trading_day), \
-         patch("stock_trading_agent.agent.open_positions", mock_open_positions), \
+         patch("stock_trading_agent.agent.stages.open_positions", mock_open_positions), \
          patch("stock_trading_agent.feishu.pusher._send_webhook", mock_pusher):
         from stock_trading_agent.agent import run_once
         result = run_once("pick")

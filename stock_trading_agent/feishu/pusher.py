@@ -5,6 +5,7 @@ feishu/pusher.py — 飞书卡片推送
 from __future__ import annotations
 
 import json
+import logging
 import os
 from datetime import datetime
 from typing import Any, Optional
@@ -12,6 +13,7 @@ from typing import Any, Optional
 from ..engine.data_fetcher import _secret, is_placeholder, load_env
 from ._http import http_post
 
+log = logging.getLogger("feishu.pusher")
 # v12: 防御性 strip <think>...</think> 块 (minimax M3 等推理模型在 weekly_summary / pick_intro 等注入)
 # 在 _send 入口剥一次, 6 个 push_xxx 都自动覆盖
 import re as _re
@@ -49,7 +51,8 @@ def _send_webhook(text: str) -> dict[str, Any]:
         r = http_post(url, json=payload, timeout=10)
         return {"ok": r.status_code == 200, "status": r.status_code, "body": r.text[:200], "channel": "webhook"}
     except Exception as e:
-        return {"ok": False, "error": str(e), "channel": "webhook"}
+        log.warning("_send_webhook 失败: %s: %s", type(e).__name__, str(e)[:200])
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}", "channel": "webhook"}
 
 
 
@@ -93,7 +96,8 @@ def _send_via_app(text: str, msg_type: str = "text", chat_id: Optional[str] = No
         return {"ok": ok, "status": r.status_code, "channel": "app",
                 "body": (resp.get("msg") or r.text[:200])}
     except Exception as e:
-        return {"ok": False, "error": str(e), "channel": "app"}
+        log.warning("_send_via_app 失败: %s: %s", type(e).__name__, str(e)[:200])
+        return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:200]}", "channel": "app"}
 
 
 def _send(text: str, msg_type: str = "text", chat_id: Optional[str] = None) -> dict[str, Any]:

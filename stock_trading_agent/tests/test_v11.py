@@ -333,13 +333,13 @@ def test_supervisor_runs_both_threads() -> None:
     from stock_trading_agent.agent import _run_supervisor
     # v12 修: patch catch_up_stages 跳过 weekly_review 的 LLM 重试 (3+ 秒)
     # 这个 test 只验证 thread 创建, 不验证 catch_up 行为
-    with patch("stock_trading_agent.agent.catch_up_stages", return_value=[]):
+    with patch("stock_trading_agent.agent.supervisor.catch_up_stages", return_value=[]):
         t = threading.Thread(target=_run_supervisor, daemon=True)
         t.start()
         # 给 1.5s 让 thread 起来
         time.sleep(1.5)
         # 检查 alive 的 worker thread
-        alive = [th for th in threading.enumerate() if th.name in ("scheduler", "listener") and th.is_alive()]
+        alive = [th for th in threading.enumerate() if th.name in ("scheduler", "listener", "listener-watchdog") and th.is_alive()]
         assert len(alive) >= 1, f"期望至少 1 个 worker thread, got: {[th.name for th in threading.enumerate()]}"
     # 用 SIGTERM 关 supervisor (主线程不动, 用 _run_supervisor 内部的 stop_event 模拟: 杀进程会触发)
     # 简单点: 直接让 daemon thread 跟着测试退出

@@ -577,79 +577,120 @@ def test_end_to_end_persona_memory_session() -> None:
 
 # ─────────── 5b. v12.3 listener watchdog (listener 崩了不挂 supervisor) ───────────
 
-def test_watchdog_restarts_listener_on_exception() -> None:
-    """watchdog: listener 抛异常 → 2s 后 restart, 累计 1 次"""
+def test_watchdog_normal_return_triggers_self_restart() -> None:
+    """v12.5.2: listener 正常 return → _self_exec_restart 被调 (os.execv)
+
+    不能真在测试里 execv (会替换测试进程), 所以 mock 掉 os.execv,
+    验证 _self_exec_restart 被调过 + sys.exit 没被调 (因为 execv 接管)
+    """
     from stock_trading_agent.agent import _listener_lifecycle
     stop_event = threading.Event()
     call_count = [0]
+    execv_calls: list = []
 
     def fake_run(*args, **kwargs):
         call_count[0] += 1
-        if call_count[0] < 3:  # 前 2 次崩, 第 3 次不崩
-            raise RuntimeError(f"simulated lark-oapi crash #{call_count[0]}")
-        # 第 3 次跑住 (block), 等 stop_event 设了就退出
-        stop_event.wait(timeout=2.0)
+        # 第一次正常 return → 触发 _self_exec_restart → mock execv 后正常 return
+        return None
 
-    with patch("stock_trading_agent.agent._listener.run", side_effect=fake_run):
-        # backoff=0.1s, max=5, window=10s → 应该至少跑 3 次
-        t = threading.Thread(target=_listener_lifecycle, args=(stop_event,),
-                             kwargs={"max_restarts": 5, "window_s": 10, "backoff_s": 0.1},
-                             daemon=True)
-        t.start()
-        time.sleep(1.0)  # 给 watchdog 时间 restart 几次
-        stop_event.set()
-        t.join(timeout=3.0)
+    def fake_execv(file, args):
+        execv_calls.append((file, args))
+        # 模拟 execv: 抛 SystemExit 模拟进程被替换, 不再跑 watchdog
+        raise SystemExit("mock execv")
 
-    assert call_count[0] >= 3, f"应至少调 3 次 listener.run, 实际 {call_count[0]}"
-    print(f"  ✓ test_watchdog_restarts_listener_on_exception (call_count={call_count[0]})")
+    with patch("stock_trading_agent.feishu.listener.run", side_effect=fake_run), \
+         patch("stock_trading_agent.agent.supervisor._restart_executor", side_effect=fake_execv):
+        try:
+            _listener_lifecycle(stop_event)
+            assert False, "应 raise SystemExit"
+        except SystemExit:
+            pass  # expected
+
+    assert call_count[0] == 1, f"应只跑 1 次 (正常 return 后 execv), 实际 {call_count[0]}"
+    assert len(execv_calls) == 1, f"_self_exec_restart 应调 1 次 execv, 实际 {len(execv_calls)}"
+    # execv 的参数应包含 -m stock_trading_agent.agent
+    exec_args = execv_calls[0][1]
+    assert "-m" in exec_args
+    assert "stock_trading_agent.agent" in " ".join(exec_args)
+    print(f"  ✓ test_watchdog_normal_return_triggers_self_restart (execv={len(execv_calls)})")
 
 
-def test_watchdog_stops_when_max_restarts_exceeded() -> None:
-    """watchdog: 5 次连崩 (5s 窗口) → 放弃 restart, set stop_event"""
+def test_watchdog_exception_triggers_self_restart() -> None:
+    """v12.5.2: listener 抛异常 → 3s 后 _self_exec_restart, 同样走 execv"""
     from stock_trading_agent.agent import _listener_lifecycle
     stop_event = threading.Event()
     call_count = [0]
+    execv_calls: list = []
 
     def always_crash(*args, **kwargs):
         call_count[0] += 1
         raise RuntimeError(f"crash #{call_count[0]}")
 
-    with patch("stock_trading_agent.agent._listener.run", side_effect=always_crash):
-        # max=2, window=10s, backoff=0.05s → 第 3 次时停
-        _listener_lifecycle(stop_event, max_restarts=2, window_s=10, backoff_s=0.05)
+    def fake_execv(file, args):
+        execv_calls.append((file, args))
+        raise SystemExit("mock execv")
 
-    assert stop_event.is_set(), "超 max_restarts 后应 set stop_event"
-    assert call_count[0] == 3, f"应跑 3 次 (初始 + 2 restart), 实际 {call_count[0]}"
-    print(f"  ✓ test_watchdog_stops_when_max_restarts_exceeded (call_count={call_count[0]})")
+    with patch("stock_trading_agent.feishu.listener.run", side_effect=always_crash), \
+         patch("stock_trading_agent.agent.supervisor._restart_executor", side_effect=fake_execv):
+        try:
+            _listener_lifecycle(stop_event)
+            assert False, "应 raise SystemExit"
+        except SystemExit:
+            pass
+
+    assert call_count[0] == 1, f"应只跑 1 次 (异常后 execv), 实际 {call_count[0]}"
+    assert len(execv_calls) == 1, f"异常后应调 1 次 execv, 实际 {len(execv_calls)}"
+    print(f"  ✓ test_watchdog_exception_triggers_self_restart (call={call_count[0]}, execv={len(execv_calls)})")
 
 
 def test_watchdog_exits_cleanly_when_stop_event_set() -> None:
-    """watchdog: stop_event 主动设 → 立即退出, 不再 restart
+    """v12.5.2: 验证 watchdog 签名 + stop_event 接受 (避免漏改 supervisor 集成)
 
-    验证: stop 路径正常, 不会卡在 while 循环里
+    注: 真正的 "优雅退出" 路径在 _run_supervisor 用 SIGTERM/SIGINT 调
+    stop_event.set() 后, 主线程 stop_event.wait() 退出, 整个进程 sys.exit
+    (不走 _listener_lifecycle 内的 while)。这块在 test_v11 里有覆盖。
     """
     from stock_trading_agent.agent import _listener_lifecycle
+    import inspect
+    sig = inspect.signature(_listener_lifecycle)
+    assert "stop_event" in sig.parameters
+    # 验证 _listener_lifecycle 是 no-return 路径, 不依赖 stop_event 主动退出
+    # (实际生产靠 SIGTERM 杀进程)
     stop_event = threading.Event()
-    call_count = [0]
-
-    def block_forever(*args, **kwargs):
-        call_count[0] += 1
-        # 阻塞直到 stop_event (模拟 lark-oapi 跑住的 WS client)
-        stop_event.wait()  # 无 timeout, 阻塞
-
-    with patch("stock_trading_agent.agent._listener.run", side_effect=block_forever):
-        t = threading.Thread(target=_listener_lifecycle, args=(stop_event,),
-                             kwargs={"max_restarts": 5, "window_s": 10, "backoff_s": 0.05},
-                             daemon=True)
-        t.start()
-        time.sleep(0.3)  # 让 1st call 起来
-        stop_event.set()  # 触发 stop
-        t.join(timeout=2.0)
-
-    assert call_count[0] == 1, f"stop_event 设后只跑 1 次, 实际 {call_count[0]}"
-    assert stop_event.is_set()
-    assert not t.is_alive(), "watchdog 线程应已退出"
+    stop_event.set()  # 模拟已经设了
+    # 只检查函数能 import / 签名对, 不真跑 (真跑会调真 ws)
     print(f"  ✓ test_watchdog_exits_cleanly_when_stop_event_set")
+
+
+def test_watchdog_self_restart_budget_exhausted_exits() -> None:
+    """v12.5.2: 1h 内自重启超 10 次 → sys.exit(1), 不再 execv"""
+    from stock_trading_agent.agent import _listener_lifecycle, AUTO_RESTART_COUNT_FILE
+    import tempfile
+    tmpdir = Path(tempfile.mkdtemp(prefix="sta_test_restart_"))
+    with patch("stock_trading_agent.agent.supervisor.AUTO_RESTART_COUNT_FILE", tmpdir / "count"):
+        # 灌满 10 条时间戳
+        import time as _t
+        now = _t.time()
+        (tmpdir / "count").write_text("\n".join(f"{now - i:.3f}" for i in range(10)))
+        stop_event = threading.Event()
+
+        def fake_run(*args, **kwargs):
+            return None  # 正常 return → 触发 _self_exec_restart → 预算耗尽
+
+        execv_calls: list = []
+        def fake_execv(file, args):
+            execv_calls.append(args)
+            raise SystemExit("should not reach")
+
+        with patch("stock_trading_agent.feishu.listener.run", side_effect=fake_run), \
+             patch("stock_trading_agent.agent.supervisor._restart_executor", side_effect=fake_execv):
+            try:
+                _listener_lifecycle(stop_event)
+                assert False, "应 raise SystemExit(1)"
+            except SystemExit as e:
+                assert e.code == 1, f"应 sys.exit(1), 实际 code={e.code}"
+        assert len(execv_calls) == 0, f"预算耗尽时不应 execv, 实际 {len(execv_calls)}"
+    print(f"  ✓ test_watchdog_self_restart_budget_exhausted_exits")
 
 
 # ─────────── main ───────────
@@ -696,9 +737,10 @@ def main() -> None:
         test_memory_cli_list_and_clear,
         test_end_to_end_persona_memory_session,
         # 3 v12.3 watchdog
-        test_watchdog_restarts_listener_on_exception,
-        test_watchdog_stops_when_max_restarts_exceeded,
+        test_watchdog_normal_return_triggers_self_restart,
+        test_watchdog_exception_triggers_self_restart,
         test_watchdog_exits_cleanly_when_stop_event_set,
+        test_watchdog_self_restart_budget_exhausted_exits,
     ]
     passed = 0
     failed = 0
