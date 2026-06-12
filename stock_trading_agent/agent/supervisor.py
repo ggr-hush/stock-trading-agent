@@ -14,6 +14,7 @@ import logging
 import os
 import signal
 import sys
+import time
 import threading
 from pathlib import Path
 from typing import NoReturn
@@ -177,26 +178,34 @@ def _self_exec_restart(reason: str) -> NoReturn:
 # ─────────── listener watchdog ───────────
 
 def _listener_lifecycle(stop_event: threading.Event) -> None:
-    """v12.5.2: listener watchdog — listener 跑完一次就 execv 自重启
+    """v12.8.1: listener watchdog — 正常 return 走 sleep 5s 重连, 异常才 execv 自重启
 
-    之前的 v12.3 限流 + sleep 重试: 错的, ws 16min 断一次是正常生命周期,
-    在同一个 supervisor 内 sleep restart 跟飞书 5xx 重投叠加制造"问 1 回 2"。
+    v12.5.2 设计: listener 跑完一次就 os.execv 整进程自重启, 1h 限 10 次。
+    问题是飞书 WebSocket 每 ~16min 一次 keepalive ping 超时是 SDK 正常生命周期,
+    每次都重启导致:
+      - cron job 状态丢失, 14:00 pick 错过
+      - 自重启计数器容易耗尽 → supervisor 死 → 6/11 23:23 之后 24h 没 stage
+      - 数据迁移/记账半中间态
 
-    新设计: 每次 listener 跑完 (无论正常/异常), 整个 supervisor os.execv
-    重启自己, 1h 限 10 次防止 bug 死循环。
+    v12.8.1 新设计:
+      - 正常 return (ws 断线) → sleep 5s → 再起 listener.run()  (跟 v12.3 一样, 但 v12.5.1 已修 5xx 重投, 不会叠加)
+      - 异常 (代码 bug) → 3s 后 execv 重启 supervisor, 1h 限 10 次 (防 bug 死循环)
     """
-    log.info("[listener-watchdog] 启动 (模式=自重启, 1h 限 %d 次)", AUTO_RESTART_MAX)
+    log.info("[listener-watchdog] 启动 (v12.8.1: 正常 return sleep 重连, 异常 execv)")
     while not stop_event.is_set():
         try:
             log.info("[listener-watchdog] listener.run() 启动")
             _listener.run(quiet=False)
-            _self_exec_restart("listener 正常 return (ws 16min 断线/网络抖动)")
+            # 正常 return (ws 16min 断线/网络抖动) → sleep 重连
+            if stop_event.is_set():
+                break
+            log.info("[listener-watchdog] listener 正常 return, 5s 后重连 (ws 生命周期)")
+            time.sleep(5)
         except KeyboardInterrupt:
             raise
         except Exception as e:  # noqa: BLE001
-            import time as _t
-            log.exception("[listener-watchdog] listener 崩了: %s, 3s 后自重启", e)
-            _t.sleep(3)
+            log.exception("[listener-watchdog] listener 崩了: %s, 3s 后 execv 自重启", e)
+            time.sleep(3)
             _self_exec_restart(f"listener 异常: {type(e).__name__}: {str(e)[:80]}")
 
 

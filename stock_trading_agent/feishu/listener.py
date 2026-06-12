@@ -14,11 +14,53 @@ import signal
 import sys
 import threading
 import time
+from pathlib import Path
 from typing import Any
 
 log = logging.getLogger("feishu.listener")
 
 EVENT_KEY = "im.message.receive_v1"
+# ────────── v12.8: dup skip 可观测化 ──────────
+# 写 bot_sessions system note + 计数器 JSON, 不阻塞主流程
+_DEDUP_STATS_PATH = Path(__file__).parent.parent.parent / "data" / "dedup_stats.json"
+
+
+def _record_dup_skip(chat_id: str, message_id: str, text: str) -> None:
+    """v12.8: dup skip 时落 2 处:
+      1. bot_sessions 写 system note "[dup skip] {text}" (历史可查)
+      2. data/dedup_stats.json 计数器 +1 (今日累计 + 5min 窗口)
+    失败 → 静默, 不影响主流程
+    """
+    # 1) session note
+    try:
+        from ..engine.sessions import append_turn as _session_append
+        _session_append(chat_id, "system", f"[dup skip] {text[:100]}")
+    except Exception as e:  # noqa: BLE001
+        log.debug("dup skip session note 失败 (忽略): %s", e)
+    # 2) 计数器
+    try:
+        import json as _json
+        from datetime import datetime as _dt
+        now = _dt.now()
+        stats: dict = {}
+        if _DEDUP_STATS_PATH.exists():
+            try:
+                stats = _json.loads(_DEDUP_STATS_PATH.read_text(encoding="utf-8"))
+            except Exception:
+                stats = {}
+        today = now.strftime("%Y-%m-%d")
+        if stats.get("date") != today:
+            stats = {"date": today, "today_count": 0, "recent_5min": []}
+        stats["today_count"] = stats.get("today_count", 0) + 1
+        # recent_5min: 滚动 5min 内时间戳列表
+        recent = [t for t in stats.get("recent_5min", [])
+                  if (now.timestamp() - t) < 300]
+        recent.append(now.timestamp())
+        stats["recent_5min"] = recent
+        _DEDUP_STATS_PATH.parent.mkdir(parents=True, exist_ok=True)
+        _DEDUP_STATS_PATH.write_text(_json.dumps(stats, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log.debug("dup skip 计数器写失败 (忽略): %s", e)
 
 # ────────── 消息去重缓存 (v12.5.1) ──────────
 # 根因: lark-oapi 5xx / WebSocket reconnect 会重投同 message_id 的事件
@@ -111,14 +153,23 @@ def _is_admin(sender_id: str, config: dict) -> bool:
 
 # ─────────── 推回原 chat (用 lark-oapi client) ───────────
 
-def _send_reply(client, chat_id: str, text: str) -> dict[str, Any]:
-    """用 lark-oapi client 把文本推回 chat_id"""
+def _send_reply(client, chat_id: str, text_or_card: Any,
+                 msg_type: str = "text") -> dict[str, Any]:
+    """用 lark-oapi client 把文本/卡片推回 chat_id
+
+    msg_type="text" → text_or_card 是 str
+    msg_type="interactive" → text_or_card 是 card dict
+    """
     try:
         from lark_oapi.api.im.v1 import CreateMessageRequest, CreateMessageRequestBody
+        if msg_type == "interactive" and isinstance(text_or_card, dict):
+            content = text_or_card  # card dict 整段当 content
+        else:
+            content = {"text": text_or_card if isinstance(text_or_card, str) else str(text_or_card)}
         body = CreateMessageRequestBody.builder() \
             .receive_id(chat_id) \
-            .msg_type("text") \
-            .content(json.dumps({"text": text}, ensure_ascii=False)) \
+            .msg_type(msg_type) \
+            .content(json.dumps(content, ensure_ascii=False)) \
             .build()
         req = CreateMessageRequest.builder() \
             .receive_id_type("chat_id") \
@@ -181,12 +232,13 @@ def _handle_event(event: dict, lark_cli: str = "/dev/null") -> dict:
     return {"chat_id": chat_id, "message_id": message_id, "answer_len": len(answer), "send": send_result}
 
 
-def _send_card(client, chat_id: str, text: str, msg_type: str = "text") -> dict[str, Any]:
-    """v11: 发送 card (msg_type 支持 text/post/...)"""
-    if msg_type == "text":
-        return _send_reply(client, chat_id, text)
-    # 扩展: 其它 msg_type (interactive card 等) 后续接
-    return _send_reply(client, chat_id, text)
+def _send_card(client, chat_id: str, text_or_card: Any, msg_type: str = "text") -> dict[str, Any]:
+    """v11/v12.9.1: 发送 card
+
+    msg_type="text" → text_or_card 是 str, 发纯文本
+    msg_type="interactive" → text_or_card 是 card dict (飞书 interactive card JSON)
+    """
+    return _send_reply(client, chat_id, text_or_card, msg_type=msg_type)
 
 
 def _send_reply_legacy(message_id: str, text: str, lark_cli: str) -> dict:
@@ -221,8 +273,11 @@ def _make_handler(client, get_config):
             return
 
         # v12.5.1: message_id 去重 (lark-oapi 5xx / reconnect 重投同一事件)
+        # v12.8: 升级 warning + 写 bot_sessions system note + 计数器 +1
         if not _mark_seen(message_id):
-            log.info("dup skip msg=%s text=%r", message_id, text[:60])
+            log.warning("dup skip: chat=%s msg=%s text=%r",
+                        chat_id, message_id, text[:60])
+            _record_dup_skip(chat_id, message_id, text)
             return
 
         cfg = get_config() or {}
@@ -252,6 +307,19 @@ def _make_handler(client, get_config):
             _session_append(chat_id, "user", text)
         except Exception as e:  # noqa: BLE001
             log.debug("session append_turn(user) 失败 (忽略): %s", e)
+
+        # v12.9.1: admin 斜杠命令早返回, 不进 LLM dispatch (省 token + 快)
+        if text.startswith("/"):
+            from .admin_cmd import handle as _admin_handle
+            admin_card = _admin_handle(text, sender_id, chat_id, cfg or {})
+            if admin_card is not None:
+                card = admin_card
+                text_reply = card.get("content", {}).get("text", "")
+                if not text_reply and card.get("msg_type") == "interactive":
+                    text_reply = "(interactive card)"  # 占位, 实际用 _send_card
+                send_result = _send_card(client, chat_id, card.get("content", card), card.get("msg_type", "text"))
+                log.info("admin cmd replied: ok=%s cmd=%s", send_result.get("ok"), text[:30])
+                return  # 早返回, 不走 dispatch
 
         from ..engine.paper_trader import init_account
         from ..llm.tool_use import dispatch

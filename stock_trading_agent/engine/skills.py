@@ -75,15 +75,10 @@ def _render_picks_card(result: dict[str, Any]) -> dict[str, Any]:
     items = result.get("items", [])
     if not items:
         return {"msg_type": "text", "content": {"text": "(无选股记录)"}}
-    head = f"📊 选股 · {result.get('date', '?')} · 共 {result.get('count', 0)} 只"
-    lines = [head, ""]
-    for i, p in enumerate(items, 1):
-        chg = p.get("chg_pct") or 0
-        lines.append(
-            f"{i:2d}. {p.get('code', '')} {p.get('name', '')}  "
-            f"评分 {p.get('score', 0):.1f} 涨幅 {chg:+.1f}% 板块 {p.get('sector', '-')}"
-        )
-    return {"msg_type": "text", "content": {"text": "\n".join(lines)}}
+    # v12.9.1: 改用 interactive card
+    from ..feishu.card_templates import card_picks
+    card = card_picks(items, date=result.get("date", ""))
+    return {"msg_type": "interactive", "content": card}
 
 
 def _run_get_positions(args: dict[str, Any]) -> dict[str, Any]:
@@ -107,17 +102,10 @@ def _render_positions_card(result: dict[str, Any]) -> dict[str, Any]:
     items = result.get("items", [])
     if not items:
         return {"msg_type": "text", "content": {"text": f"(无 {result.get('status', '')} 持仓)"}}
-    head = f"💼 持仓 · {result.get('status', '')} · {result.get('count', 0)} 只"
-    lines = [head, ""]
-    for p in items:
-        opn = p.get("pnl_open_pct") or 0
-        noon = p.get("pnl_noon_pct")
-        noon_str = f" 午 {noon:+.2f}%" if noon is not None else ""
-        lines.append(
-            f"  {p.get('code', '')} {p.get('name', '')}  开 {p.get('open_price', 0):.2f}  "
-            f"开仓PnL {opn:+.2f}%{noon_str}"
-        )
-    return {"msg_type": "text", "content": {"text": "\n".join(lines)}}
+    # v12.9.1: 改用 interactive card
+    from ..feishu.card_templates import card_positions
+    card = card_positions(items)
+    return {"msg_type": "interactive", "content": card}
 
 
 def _run_get_daily_report(args: dict[str, Any]) -> dict[str, Any]:
@@ -246,8 +234,25 @@ def _render_stage_runs_card(result: dict[str, Any]) -> dict[str, Any]:
     return {"msg_type": "text", "content": {"text": "\n".join(lines)}}
 
 
+def _build_explain_query(pick: dict[str, Any]) -> str:
+    """v12.9: 拼 RAG-friendly query, 让 BM25 能从缠论108课/好运2008 召回相关片段
+
+    之前: f"为什么选 {code} {name} (评分 X, 板块 Y)?" — 问法太口语, 知识库召回率 ~0
+    现在: 拼 4 类关键词, 命中知识库多个源:
+      - 股票名 + 板块
+      - 缠中说禅术语 (买点 / 卖点 / 趋势 / 背驰)
+      - 好运2008 术语 (龙头 / 主线 / 量价齐升)
+      - 评分维度 (强信号 / 高分)
+    """
+    name = pick.get("name", "")
+    sector = pick.get("sector", "-")
+    score = pick.get("score", 0)
+    score_band = "强信号" if score >= 75 else ("中等" if score >= 60 else "弱信号")
+    return f"{name} {sector} 缠中说禅 选股 买点 趋势 量价齐升 龙头 {score_band}"
+
+
 def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
-    from ..llm.reasoner import answer_question
+    from ..llm.reasoner import answer_question, retrieve
     code: str = args.get("code", "").strip()
     if not code:
         return {"code": code, "explanation": "（请提供股票代码）"}
@@ -258,20 +263,87 @@ def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
         (code,),
     ).fetchone()
     if not row:
-        return {"code": code, "explanation": f"（未在 picks 找到 {code}）"}
+        # v12.9.1: picks 找不到 → 拉实时行情兜底
+        from .data_fetcher import fetch_realtime_quote
+        quote = fetch_realtime_quote(code)
+        if not quote:
+            return {
+                "code": code,
+                "explanation": (
+                    f"这只票 ({code}) 不在我的选股记录里, 我也没拉到实时数据。\n\n"
+                    f"你可以试试:\n"
+                    f"1. 说股票名 (例 '茅台怎么样') 或完整 6 位代码\n"
+                    f"2. 我帮你从选股记录 / 知识库找"
+                ),
+                "source": "fallback_empty",
+            }
+        # 实时拉到 → 让 LLM 用实时数据给一句话解释
+        name = quote.get("name") or code
+        price = quote.get("price")
+        chg = quote.get("chg_pct")
+        turnover = quote.get("turnover")
+        mktcap = quote.get("mktcap_yi")
+        # 拼事实给 LLM
+        facts = f"{name}({code}) 最新价 {price}, 今日 {chg}%, 换手 {turnover}%, 总市值 {mktcap}亿"
+        explanation = answer_question(
+            question=f"用大白话一句话说说 {facts}, 给小白用户看 (≤ 100 字)",
+            recent_picks=[],
+            market_env={},
+        )
+        explanation = (explanation or "（实时数据已拉到, LLM 暂不可用）").rstrip()
+        explanation += "\n\n[数据源: 东方财富实时]"
+        return {
+            "code": code,
+            "name": name,
+            "explanation": explanation,
+            "source": "realtime",
+            "quote": quote,
+        }
     pick = dict(row)
+
+    # v12.9: 先 RAG 检索知识库, 把最相关 k 条来源注入 prompt, 末尾再标注 [来源]
+    rag_query = _build_explain_query(pick)
+    rag_results = retrieve(rag_query, k=5)
+    # 来源标注: 优先 title, 否则 source:text 前 20 字
+    rag_sources: list[str] = []
+    for r in rag_results[:3]:
+        title = r.get("title", "").strip()
+        if title:
+            rag_sources.append(title)
+        else:
+            src_short = r.get("source", "?")
+            text_short = (r.get("text", "") or "").strip()[:20]
+            rag_sources.append(f"{src_short}:{text_short}")
+
     explanation = answer_question(
-        question=f"为什么选 {code} {pick.get('name', '')} (评分 {pick.get('score', 0):.1f}, 板块 {pick.get('sector', '-')})?",
+        question=rag_query,
         recent_picks=[pick],
         market_env={"env_score": pick.get("market_env_score"), "env_level": "-", "position_advice": "-"},
+        preset_results=rag_results,  # v12.9: 复用, 不重复 retrieve
     )
-    return {"code": code, "name": pick.get("name"), "explanation": explanation or "（LLM 暂不可用）"}
+    # 末尾追加 [来源: ...], 即便 LLM 没在正文里标也能让用户知道用了哪些知识
+    if explanation and rag_sources:
+        explanation = explanation.rstrip() + "\n\n[来源] " + " / ".join(rag_sources)
+    return {"code": code, "name": pick.get("name"),
+            "explanation": explanation or "（LLM 暂不可用）",
+            "rag_sources": rag_sources}
+    return {"code": code, "name": pick.get("name"),
+            "explanation": explanation or "（LLM 暂不可用）",
+            "rag_sources": rag_titles}
 
 
 def _render_explain_card(result: dict[str, Any]) -> dict[str, Any]:
     explanation = _strip_think(result.get("explanation", ""))
-    text = f"💡 {result.get('code', '?')} {result.get('name', '')}\n\n{explanation}"
-    return {"msg_type": "text", "content": {"text": text}}
+    sources = result.get("rag_sources") or result.get("sources") or []
+    # v12.9.1: 改用 interactive card
+    from ..feishu.card_templates import card_explain
+    card = card_explain(
+        code=result.get("code", "?"),
+        name=result.get("name", ""),
+        explanation=explanation,
+        sources=sources,
+    )
+    return {"msg_type": "interactive", "content": card}
 
 
 def _run_search_knowledge(args: dict[str, Any]) -> dict[str, Any]:
@@ -496,6 +568,8 @@ SKILL_REGISTRY: dict[str, Skill] = {
 # 关键词降级路径 (LLM 不可用时)
 # 按"最具体优先"排序, 命中第一个返回 skill 名
 _KEYWORD_FALLBACK: list[tuple[list[str], str]] = [
+    # v12.9: 知识库关键词放最前 (最具体优先)
+    (["缠论", "缠中说禅", "108课", "108 课", "好运2008", "好运 2008", "苏三", "知识库", "知识", "教材", "理论", "心法"], "search_knowledge"),
     (["picks", "选股", "今日选股", "今日推荐", "today", "今日"], "get_picks"),
     (["持仓", "positions", "开了什么", "现在有什么"], "get_positions"),
     (["日报", "daily", "今日战况", "今日怎么样"], "get_daily_report"),

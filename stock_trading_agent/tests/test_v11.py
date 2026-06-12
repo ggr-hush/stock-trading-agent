@@ -88,9 +88,11 @@ def test_skill_get_picks_returns_seeded() -> None:
     assert r["raw"]["count"] == 3
     codes = {p["code"] for p in r["raw"]["items"]}
     assert codes == {"600519", "000858", "300750"}
-    assert r["card"]["msg_type"] == "text"
-    assert "贵州茅台" in r["card"]["content"]["text"]
-    print(f"  ✓ get_picks 返回 {r['raw']['count']} 条, card 长度 {len(r['card']['content']['text'])}")
+    # v12.9.1: card 改 interactive
+    assert r["card"]["msg_type"] == "interactive"
+    card_text = json.dumps(r["card"]["content"], ensure_ascii=False)
+    assert "贵州茅台" in card_text
+    print(f"  ✓ get_picks 返回 {r['raw']['count']} 条, card 长度 {len(card_text)}")
 
 
 def test_skill_get_positions_returns_seeded() -> None:
@@ -272,9 +274,11 @@ def test_dispatch_llm_tool_path() -> None:
     assert r["ok"], r
     assert r["path"] == "llm_tool"
     assert r["tool_calls"][0]["name"] == "get_picks"
-    assert r["card"]["msg_type"] == "text"
-    assert "贵州茅台" in r["card"]["content"]["text"]
-    print(f"  ✓ dispatch llm_tool 路径, path=llm_tool card len={len(r['card']['content']['text'])}")
+    # v12.9.1: card 改 interactive
+    assert r["card"]["msg_type"] == "interactive"
+    card_text = json.dumps(r["card"]["content"], ensure_ascii=False)
+    assert "贵州茅台" in card_text
+    print(f"  ✓ dispatch llm_tool 路径, path=llm_tool card len={len(card_text)}")
 
 
 def test_dispatch_keyword_fallback_path() -> None:

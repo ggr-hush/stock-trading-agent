@@ -179,3 +179,6 @@ llm:
   api_key_env: MINIMAX_API_KEY
   timeout_s: 30
   max_retries: 2
+  temperature: 0.7
+  max_tokens: 800
+  # v12.8: 自由回答更自然, 800 tokens 够用, 不触发限流

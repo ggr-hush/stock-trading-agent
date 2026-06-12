@@ -32,12 +32,62 @@ from ..feishu import pusher
 from ..llm.reasoner import weekly_summary
 
 log = logging.getLogger("agent.stages")
+# v12.8.1: stage 失败记账装饰器 — 防止静默 except 导致 stage_runs 不更新
+# v12.9.2: 关键 stage 失败时 retry 1 次 (间隔 30s) — 治偶发网络挂导致整天 0 stage
+RETRYABLE_STAGES = {"pre_market", "pick", "evening", "weekly_review"}
+_RETRY_DELAY_S = 30
+
+
+def _with_stage_run_logging(stage_name: str):
+    """包裹 stage 函数: 成功 → mark_stage_run(name, ok=True), 失败 → mark_stage_run(name, ok=False)
+
+    v12.9.2: 关键 stage (RETRYABLE_STAGES) 失败时 retry 1 次, 仍失败才记 ok=False。
+    不影响原函数返回值, 不影响 cron 注册。
+    """
+    from functools import wraps
+    import time as _t
+    def deco(fn):
+        @wraps(fn)
+        def wrapper(*args, **kwargs):
+            max_attempts = 2 if stage_name in RETRYABLE_STAGES else 1
+            last_err: Exception | None = None
+            for attempt in range(1, max_attempts + 1):
+                try:
+                    result = fn(*args, **kwargs)
+                    try:
+                        mark_stage_run(stage_name, ok=True)
+                    except Exception as e:  # noqa: BLE001
+                        log.warning("stage %s 成功但记账失败: %s", stage_name, e)
+                    if attempt > 1:
+                        log.info("stage %s 第 %d 次重试成功", stage_name, attempt)
+                    return result
+                except Exception as e:  # noqa: BLE001
+                    last_err = e
+                    if attempt < max_attempts:
+                        log.warning("stage %s 第 %d 次失败 (%s), %ds 后重试",
+                                    stage_name, attempt, type(e).__name__, _RETRY_DELAY_S)
+                        _t.sleep(_RETRY_DELAY_S)
+                    else:
+                        log.exception("stage %s 失败 (尝试 %d 次): %s", stage_name, attempt, e)
+            # 所有重试都失败
+            try:
+                mark_stage_run(stage_name, ok=False)
+            except Exception as e2:  # noqa: BLE001
+                log.warning("stage %s 失败且记账失败: %s", stage_name, e2)
+            assert last_err is not None
+            return {"ok": False, "stage": stage_name,
+                    "error": f"{type(last_err).__name__}: {str(last_err)[:200]}",
+                    "retried": max_attempts > 1}
+        return wrapper
+    return deco
+
 
 PID_FILE = None  # 占位, supervisor.PID_FILE 才是真 (re-export)
 
 
 # ─────────── 6 个阶段 ───────────
 
+@_with_stage_run_logging("pre_market")
 def stage_pre_market() -> dict[str, Any]:
     if not is_trading_day():
         log.info("非交易日, 跳过盘前复盘")
@@ -49,6 +99,7 @@ def stage_pre_market() -> dict[str, Any]:
     return summary
 
 
+@_with_stage_run_logging("open_auction")
 def stage_open_auction() -> dict[str, Any]:
     opens = get_open_positions()
     if opens:
@@ -56,6 +107,7 @@ def stage_open_auction() -> dict[str, Any]:
     return {"open_count": len(opens), "opens": opens}
 
 
+@_with_stage_run_logging("pick")
 def stage_pick() -> dict[str, Any]:
     if not is_trading_day():
         log.info("非交易日, 跳过选股")
@@ -78,11 +130,43 @@ def stage_pick() -> dict[str, Any]:
     return {"plan": result["plan_used"], "n_open": n_open}
 
 
+@_with_stage_run_logging("post_market")
 def stage_post_market() -> dict[str, Any]:
-    pusher.push_post_market(0, "占位", [])
-    return {"ok": True}
+    """v12.9.1: 真实实现 - 读今日 picks + paper_positions 算模拟成交
+    之前是占位: 永远 push_post_market(0, "占位", []) 假数据
+    """
+    from datetime import date as _date
+    from ..engine.paper_trader import get_db
+    today = _date.today().isoformat()
+    conn = get_db()
+    # 今日 picks
+    picks_rows = conn.execute(
+        "SELECT pick_date, code, name, price, chg_pct, score, sector, plan_used "
+        "FROM picks WHERE pick_date = ? ORDER BY score DESC",
+        (today,),
+    ).fetchall()
+    if not picks_rows:
+        log.info("post_market: 今日无 picks, 跳过")
+        return {"ok": True, "skipped": "no picks", "filled_count": 0}
+    # 哪些已开仓 (status='open')
+    open_rows = conn.execute(
+        "SELECT code, name, open_price, shares FROM paper_positions "
+        "WHERE pick_date = ? AND status = 'open'",
+        (today,),
+    ).fetchall()
+    open_codes = {r[0] for r in open_rows}
+    picks_with_status: list[dict] = []
+    for r in picks_rows:
+        p = dict(r)
+        p["is_filled"] = p["code"] in open_codes
+        picks_with_status.append(p)
+    filled_count = sum(1 for p in picks_with_status if p["is_filled"])
+    pusher.push_post_market(filled_count, "模拟成交", picks_with_status)
+    log.info("post_market: picks=%d filled=%d", len(picks_with_status), filled_count)
+    return {"ok": True, "filled_count": filled_count, "picks_count": len(picks_with_status)}
 
 
+@_with_stage_run_logging("evening")
 def stage_evening() -> dict[str, Any]:
     today = datetime.now().strftime("%Y-%m-%d")
     summary = run_daily_review(today)
@@ -90,11 +174,13 @@ def stage_evening() -> dict[str, Any]:
     return summary
 
 
+@_with_stage_run_logging("intraday_monitor")
 def stage_intraday_monitor() -> dict[str, Any]:
     """v9.3: 盘中盯盘, 异动推飞书告警"""
     return intraday_monitor()
 
 
+@_with_stage_run_logging("weekly_review")
 def stage_weekly_review() -> dict[str, Any]:
     """v7.3: 周日 20:00 自动跑全量周报"""
     cfg = load_config()

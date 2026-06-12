@@ -32,6 +32,36 @@ log = logging.getLogger("llm.tool_use")
 _LLM_LOCK = threading.Lock()
 
 
+# ─────────── v12.8: freeform 空响应兜底 + 60s 缓存 ───────────
+# 避免同 chat_id 短时间内反复触发 LLM 空响应 → 浪费 quota
+_EMPTY_CACHE: dict[str, tuple[float, str]] = {}  # chat_id → (ts, fallback_text)
+_EMPTY_CACHE_TTL_S = 60
+_EMPTY_CACHE_MAX = 500
+
+
+def _empty_response_fallback(text: str, chat_id: str | None) -> str:
+    """v12.8: LLM 返空 content 时的兜底话术
+
+    - 60s 内同 chat_id 重复问 → 走缓存 (避免反复 LLM 调用)
+    - chat_id=None (webhook) → 不缓存, 每次走随机
+    """
+    from ..assistant.persona import pick_fallback_phrase
+    if not chat_id:
+        return pick_fallback_phrase()
+    now = time.time()
+    # 清理过期 + LRU 上限
+    if len(_EMPTY_CACHE) > _EMPTY_CACHE_MAX:
+        cutoff = now - _EMPTY_CACHE_TTL_S
+        for k in [k for k, (t, _) in list(_EMPTY_CACHE.items()) if t < cutoff]:
+            _EMPTY_CACHE.pop(k, None)
+    cached = _EMPTY_CACHE.get(chat_id)
+    if cached and (now - cached[0]) < _EMPTY_CACHE_TTL_S:
+        return cached[1]
+    fb = pick_fallback_phrase()
+    _EMPTY_CACHE[chat_id] = (now, fb)
+    return fb
+
+
 def _llm_payload(messages: list[dict[str, str]], tools: list[dict[str, Any]], **kwargs) -> dict[str, Any]:
     """构造 OpenAI 兼容的 chat/completions payload (含 tools)"""
     from .client import _get_config
@@ -216,6 +246,25 @@ def dispatch(
         return {"ok": False, "path": "empty", "card": _empty_card("（空消息）"),
                 "tool_calls": [], "raw": {}, "error": "empty text"}
 
+    # v12.8: 60s 窗口内同 chat_id 重复 → 直接走上次兜底, 跳过 LLM
+    if chat_id:
+        now = time.time()
+        if len(_EMPTY_CACHE) > _EMPTY_CACHE_MAX:
+            cutoff = now - _EMPTY_CACHE_TTL_S
+            for k in [k for k, (t, _) in list(_EMPTY_CACHE.items()) if t < cutoff]:
+                _EMPTY_CACHE.pop(k, None)
+        cached = _EMPTY_CACHE.get(chat_id)
+        if cached and (now - cached[0]) < _EMPTY_CACHE_TTL_S:
+            log.info("freeform 60s 命中缓存: chat=%s (跳过 LLM)", chat_id)
+            return {
+                "ok": True,
+                "path": "llm_freeform_empty_cached",
+                "card": {"msg_type": "text", "content": {"text": cached[1]}},
+                "tool_calls": [],
+                "raw": {"content": ""},
+                "error": None,
+            }
+
     # 拼系统 prompt + 上下文
     sys_prompt = _build_system_prompt(chat_id=chat_id)
     context_lines = []
@@ -251,7 +300,13 @@ def dispatch(
     messages.append({"role": "user", "content": text.strip()})
 
     # 1) LLM 路由
-    resp = chat_with_tools(messages, tools=tool_schemas(), max_tokens=400)
+    # v12.8: temperature / max_tokens 走 config (默认 0.7 / 800, 治自由回答干瘪)
+    from .client import _get_config
+    _llm_cfg = _get_config()
+    _llm_temp = _llm_cfg.get("temperature", 0.7)
+    _llm_max = _llm_cfg.get("max_tokens", 800)
+    resp = chat_with_tools(messages, tools=tool_schemas(),
+                           temperature=_llm_temp, max_tokens=_llm_max)
     if not resp["ok"]:
         # LLM 不可用 → 关键词降级
         log.info("LLM 不可用, 走关键词降级: %s", resp.get("error", "")[:80])
@@ -284,9 +339,24 @@ def dispatch(
     tool_calls = resp.get("tool_calls", [])
     if not tool_calls:
         # LLM 选了不调 tool → 自由回答 (兼容老 chat_with_session 行为)
-        content = _strip_think_tags(resp.get("content", "").strip())
+        raw_content = resp.get("content", "").strip()
+        content = _strip_think_tags(raw_content)
         if not content:
-            content = "（LLM 未返回内容, 请重试）"
+            # v12.8: 空响应兜底 — 走 persona.fallback_phrases 随机选 1, 不再静默
+            #        同 chat_id 60s 窗口内直接走缓存, 避免重复 LLM 浪费
+            fb = _empty_response_fallback(text, chat_id)
+            log.warning("freeform 空响应: chat=%s text=%r content_len=%d fallback=%r",
+                        chat_id, text[:50], len(raw_content), fb[:40])
+            _log_call("tool_use_dispatch", False, resp.get("latency_ms", 0),
+                      chat_id=chat_id, error="empty content (fallback used)")
+            return {
+                "ok": True,
+                "path": "llm_freeform_empty",
+                "card": {"msg_type": "text", "content": {"text": fb}},
+                "tool_calls": [],
+                "raw": {"content": ""},
+                "error": None,
+            }
         _log_call("tool_use_dispatch", True, resp.get("latency_ms", 0),
                   chat_id=chat_id)
         return {

@@ -9,6 +9,7 @@ data_fetcher.py — 行情数据抓取层
 from __future__ import annotations
 
 import json
+from urllib.parse import urlencode
 import os
 import re
 import subprocess
@@ -202,9 +203,27 @@ def curl_get(url: str, referer: str = "https://data.eastmoney.com/") -> str:
 
 # ─────────── 交易日工具 ───────────
 
+# v12.9.1: A 股 2026 法定节假日常量 (元旦 1 / 春节 7 / 清明 3 / 劳动 3 / 端午 3 / 中秋 3 / 国庆 7 = 27 天)
+# 调休补班 (周末调成工作日) 暂不处理, 留 v12.10 接 tushare trade_cal
+_A_SHARE_HOLIDAYS_2026: set[str] = {
+    "2026-01-01", "2026-01-02", "2026-01-03",  # 元旦
+    "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",  # 春节
+    "2026-04-04", "2026-04-05", "2026-04-06",  # 清明
+    "2026-05-01", "2026-05-02", "2026-05-03",  # 劳动
+    "2026-06-19", "2026-06-20", "2026-06-21",  # 端午
+    "2026-09-25", "2026-09-26", "2026-09-27",  # 中秋
+    "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07",  # 国庆
+}
+
+
 def is_trading_day(ref_date: Optional[date] = None) -> bool:
+    """判断 A 股交易日: weekday < 5 (Mon-Fri) 且不在法定节假日"""
     d = ref_date or date.today()
-    return d.weekday() < 5
+    if d.weekday() >= 5:
+        return False
+    if d.isoformat() in _A_SHARE_HOLIDAYS_2026:
+        return False
+    return True
 
 
 def get_latest_trading_day(ref_date: Optional[date] = None) -> date:
@@ -231,6 +250,68 @@ def _build_secid(code: str) -> str:
     if code.startswith(("6", "9")):
         return "1." + code
     return "0." + code
+
+
+def fetch_realtime_quote(code: str, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """v12.9.1: 单票实时行情 (东方财富 push2delay)
+
+    返 {name, price, chg_pct, turnover, volume, sector, mktcap} 7 字段。
+    失败 (非交易时间 / 网络挂 / 代码错) 返空 dict, 不抛异常。
+
+    接口: push2delay 的 secid 单票查询
+    字段: f12=代码 f14=名称 f2=最新价 f3=涨跌幅% f5=成交额 f6=换手率%
+          f8=换手率(另一口径) f9=市盈率 f10=量比 f20=总市值 f21=流通市值
+    """
+    if not code or len(code) != 6 or not code.isdigit():
+        return {}
+    try:
+        cfg = config or load_config()
+        base = cfg["data_source"]["eastmoney_base"]
+    except Exception:
+        return {}
+    secid = _build_secid(code)
+    url = f"{base}/api/qt/stock/get"
+    params = {
+        "secid": secid,
+        "fields": "f12,f14,f2,f3,f5,f6,f8,f10,f20,f21",
+        "invt": "2",
+        "fltt": "2",
+        "_": str(int(time.time() * 1000)),
+    }
+    try:
+        text = curl_get(url + "?" + urlencode(params))
+        if not text:
+            return {}
+        import json as _json
+        data = _json.loads(text)
+        if not data or str(data.get("rc", "")) not in ("0", ""):
+            return {}
+        d = data.get("data") or {}
+        if not d:
+            return {}
+        return {
+            "code": d.get("f12", code),
+            "name": d.get("f14", ""),
+            "price": _safe_float(d.get("f2")),
+            "chg_pct": _safe_float(d.get("f3")),
+            "amount_yi": _safe_float(d.get("f5")),  # 成交额(亿, 原始是元)
+            "turnover": _safe_float(d.get("f6")),    # 换手率%
+            "volume_ratio": _safe_float(d.get("f10")),
+            "mktcap_yi": _safe_float(d.get("f20")),  # 总市值(亿)
+            "source": "东方财富实时",
+        }
+    except Exception:
+        return {}
+
+
+def _safe_float(v: Any) -> float | None:
+    """东财接口数值字段可能是 '-' / '' / None, 安全转 float"""
+    if v is None or v == "" or v == "-":
+        return None
+    try:
+        return float(v)
+    except (TypeError, ValueError):
+        return None
 
 
 def get_all_stocks(config: dict[str, Any]) -> list[dict[str, Any]]:

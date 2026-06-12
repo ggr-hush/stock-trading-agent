@@ -336,8 +336,13 @@ def with_knowledge(question: str, k: int = 3, max_chars: int = 800) -> str:
 
 
 def answer_question(question: str, recent_picks: list[dict] | None = None,
-                    market_env: dict | None = None, k: int = 3) -> str:
-    """对话式问答：给 bot 用，结合近期选股 + 大盘 + 知识库"""
+                    market_env: dict | None = None, k: int = 3,
+                    preset_results: list[dict] | None = None) -> str:
+    """对话式问答：给 bot 用，结合近期选股 + 大盘 + 知识库
+
+    v12.9: preset_results 允许外部预检索 (避免重复 BM25, 也能拿到 RAG 来源做标注)
+            不传 → 内部 retrieve(question, k=k) 自己搜
+    """
     if recent_picks is None:
         recent_picks = []
     if market_env is None:
@@ -356,7 +361,8 @@ def answer_question(question: str, recent_picks: list[dict] | None = None,
         f"position={market_env.get('position_advice', '?')}"
     ) if market_env else "（无今日大盘数据）"
 
-    results = retrieve(question, k=k)
+    # v12.9: preset 优先, 否则内部 retrieve
+    results = preset_results if preset_results is not None else retrieve(question, k=k)
     knowledge = format_context(results, max_chars=800)
     prompt = _render("advisor.j2",
                      recent_picks=picks_text,

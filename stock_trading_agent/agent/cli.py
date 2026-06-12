@@ -73,6 +73,8 @@ def main() -> None:
     p_report.add_argument("--no-backtest", action="store_true")
     p_report.add_argument("--pdf", action="store_true")
     p_memory = sub.add_parser("memory", help="v12: 用户记忆管理")
+    p_dedup = sub.add_parser("dedup", help="v12.8: 飞书重投去重计数器")
+    p_dedup.add_argument("action", choices=["stats", "reset"])
     p_memory.add_argument("action", choices=["list", "clear"])
     p_memory.add_argument("--chat-id", default="default")
 
@@ -90,6 +92,9 @@ def main() -> None:
     if args.cmd == "memory":
         _handle_memory_cmd(args)
         return
+    if args.cmd == "dedup":
+        from .dedup_cli import dispatch as _dedup_dispatch
+        sys.exit(_dedup_dispatch(args.action))
     if args.cmd == "daemon":
         from .stages import run_daemon
         _install_daemon_signals()
