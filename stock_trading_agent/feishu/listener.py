@@ -62,19 +62,57 @@ def _record_dup_skip(chat_id: str, message_id: str, text: str) -> None:
     except Exception as e:  # noqa: BLE001
         log.debug("dup skip 计数器写失败 (忽略): %s", e)
 
-# ────────── 消息去重缓存 (v12.5.1) ──────────
+# ────────── 消息去重缓存 (v12.5.1 + v12.A.2) ──────────
 # 根因: lark-oapi 5xx / WebSocket reconnect 会重投同 message_id 的事件
 # 解决: 模块级 LRU + TTL 10min, 覆盖飞书 5xx 重投 + 16min 断线回放窗口
+# v12.A.2: 加文件 fallback, 跨进程持久 (agent 重启不丢)
 _DEDUP_TTL_S = 600
 _DEDUP_MAX = 2000
 _seen_msgs: dict = {}
 _seen_lock = threading.Lock()
+_SEEN_FILE = _DEDUP_STATS_PATH.parent / "dedup_seen.json"
+
+
+def _load_seen_from_disk() -> dict[str, float]:
+    """v12.A.2: 启动时从文件加载 seen_msgs, 跨进程持久"""
+    if not _SEEN_FILE.exists():
+        return {}
+    try:
+        import json as _json
+        cutoff = time.time() - _DEDUP_TTL_S
+        data = _json.loads(_SEEN_FILE.read_text(encoding="utf-8"))
+        return {k: v for k, v in data.items() if v > cutoff}
+    except Exception as e:  # noqa: BLE001
+        log.debug("load seen file 失败 (忽略): %s", e)
+        return {}
+
+
+def _save_seen_to_disk() -> None:
+    """v12.A.2: 周期性落盘, 跨重启保留 dedup 状态
+    不在每次 mark_seen 都写 (磁盘 IO 抖动), 改成每 30 条写一次
+    """
+    try:
+        import json as _json
+        _SEEN_FILE.parent.mkdir(parents=True, exist_ok=True)
+        # 写前先清过期
+        cutoff = time.time() - _DEDUP_TTL_S
+        fresh = {k: v for k, v in _seen_msgs.items() if v > cutoff}
+        _SEEN_FILE.write_text(_json.dumps(fresh, ensure_ascii=False), encoding="utf-8")
+    except Exception as e:  # noqa: BLE001
+        log.debug("save seen file 失败 (忽略): %s", e)
+
+
+# v12.A.2: 启动时从磁盘加载 (一次, 避免每次 process 都重头开始)
+_seen_msgs.update(_load_seen_from_disk())
+_seen_write_counter = 0
 
 
 def _mark_seen(message_id: str) -> bool:
-    """返回 True 表示新消息应处理, False 表示重复应跳过"""
-    # 线程安全: lark-oapi 内部 asyncio 事件循环, 但 ws 重连期间
-    # on_message 可能并发调起, 加锁保险。
+    """返回 True 表示新消息应处理, False 表示重复应跳过
+
+    v12.A.2: 每 30 次写一次文件, 跨重启保留 dedup 状态
+    """
+    global _seen_write_counter
     now = time.time()
     with _seen_lock:
         if len(_seen_msgs) > _DEDUP_MAX:
@@ -90,6 +128,11 @@ def _mark_seen(message_id: str) -> bool:
                 _seen_msgs.pop(oldest, None)
             except ValueError:
                 pass
+        # v12.A.2: 每 30 次写一次盘, 避免 IO 抖动
+        _seen_write_counter += 1
+        if _seen_write_counter >= 30:
+            _seen_write_counter = 0
+            _save_seen_to_disk()
         return True
 
 

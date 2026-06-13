@@ -49,6 +49,11 @@ class Skill:
 
 
 def _run_get_picks(args: dict[str, Any]) -> dict[str, Any]:
+    """v12.A.2 改: picks 空时返 stage 状态 (治 '无选股记录' 答非所问体感)
+
+    之前 picks 空 → 只返 {items: []} → 卡片 "无选股记录", 用户不知道为啥没
+    现在 picks 空 → 查 stage_runs 看今天 pick 跑没跑, 给用户友好提示
+    """
     target_date: str | None = args.get("date")
     top_n: int = int(args.get("top_n", 10))
     conn = get_db()
@@ -64,19 +69,39 @@ def _run_get_picks(args: dict[str, Any]) -> dict[str, Any]:
             "FROM picks ORDER BY pick_date DESC, score DESC LIMIT ?",
             (top_n,),
         ).fetchall()
-    return {
+    result: dict[str, Any] = {
         "date": target_date or (rows[0]["pick_date"] if rows else None),
         "count": len(rows),
         "items": [dict(r) for r in rows],
     }
+    # v12.A.2: picks 空时查 stage 状态
+    if not rows:
+        try:
+            from datetime import datetime as _dt
+            today = _dt.now().strftime("%Y-%m-%d")
+            stage_row = conn.execute(
+                "SELECT stage, ran_at, ok FROM stage_runs WHERE run_date=? AND stage='pick'",
+                (today,),
+            ).fetchone()
+            if stage_row is None:
+                result["empty_reason"] = f"今天 ( {today} ) pick stage 还没跑 (计划 14:00 跑)"
+            elif stage_row["ok"] == 0:
+                result["empty_reason"] = f"今天 pick stage 跑失败 ( {stage_row['ran_at'] } ), 详见 /stage"
+            else:
+                result["empty_reason"] = f"今天 pick 跑过但没出候选 (大盘/筛选太严, 详见 /stage)"
+        except Exception as e:  # noqa: BLE001
+            log.debug("_run_get_picks empty_reason 查 stage_runs 失败: %s", e)
+    return result
 
 
 def _render_picks_card(result: dict[str, Any]) -> dict[str, Any]:
     items = result.get("items", [])
     if not items:
-        return {"msg_type": "text", "content": {"text": "(无选股记录)"}}
+        # v12.A.2: picks 空时用 empty_reason 告诉用户为啥没 (治 '答非所问')
+        reason = result.get("empty_reason", "无选股记录")
+        return {"msg_type": "text", "content": {"text": f"📭 {reason}"}}
     # v12.9.1: 改用 interactive card
-    from ..feishu.card_templates import card_picks
+    from .cards import card_picks
     card = card_picks(items, date=result.get("date", ""))
     return {"msg_type": "interactive", "content": card}
 
@@ -103,7 +128,7 @@ def _render_positions_card(result: dict[str, Any]) -> dict[str, Any]:
     if not items:
         return {"msg_type": "text", "content": {"text": f"(无 {result.get('status', '')} 持仓)"}}
     # v12.9.1: 改用 interactive card
-    from ..feishu.card_templates import card_positions
+    from .cards import card_positions
     card = card_positions(items)
     return {"msg_type": "interactive", "content": card}
 
@@ -281,6 +306,100 @@ def _render_market_env_card(result: dict[str, Any]) -> dict[str, Any]:
     return {"msg_type": "text", "content": {"text": text}}
 
 
+def _run_get_stock_quote(args: dict[str, Any]) -> dict[str, Any]:
+    """v12.A.1: 个股某日 K 线 (push2his.kline)
+
+    优先级: args.date → date=今天 → 实时接口
+    失败 (代码错/网络挂/节假日无数据) → 返 source=empty
+    """
+    from .data_fetcher import fetch_stock_kline, is_trading_day
+    code: str = (args or {}).get("code", "").strip()
+    raw_date = (args or {}).get("date")
+    today = date.today()
+    if not raw_date or raw_date == "today":
+        target_date = today
+    else:
+        try:
+            from datetime import datetime as _dt
+            target_date = _dt.strptime(str(raw_date), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return {
+                "code": code, "date": str(raw_date),
+                "env_level": "日期格式错 (要 YYYY-MM-DD)",
+                "source": "bad_date",
+            }
+    if not code or len(code) != 6 or not code.isdigit():
+        return {
+            "code": code, "date": target_date.isoformat(),
+            "env_level": "请提供 6 位股票代码",
+            "source": "bad_code",
+        }
+    # 未来日
+    if target_date > today:
+        return {
+            "code": code, "date": target_date.isoformat(),
+            "env_level": "未开盘 (未来日)",
+            "source": "future",
+        }
+    # 拉 K 线
+    kline = fetch_stock_kline(code, target_date.isoformat())
+    if not kline:
+        return {
+            "code": code, "date": target_date.isoformat(),
+            "env_level": "拉不到该日 K 线 (代码错 / 节后无数据 / 接口挂)",
+            "source": "empty",
+        }
+    # K 线接口总是返最近一根, 如果不是用户问的那天 → 标 mismatch
+    fetched_date = kline.get("date")
+    if fetched_date and fetched_date != target_date.isoformat():
+        kline["date"] = fetched_date  # 用接口实际返的 (最近交易日)
+        kline["requested_date"] = target_date.isoformat()
+    return kline
+
+
+def _render_stock_quote_card(result: dict[str, Any]) -> dict[str, Any]:
+    """v12.A.1: 个股 K 线行情卡片"""
+    code = result.get("code", "?")
+    name = result.get("name") or code
+    src = result.get("source", "kline")
+    src_emoji = {
+        "kline": "📈", "东方财富K线": "📈",
+        "future": "⏳", "bad_date": "❓", "bad_code": "❓", "empty": "⚠️",
+    }.get(src, "📊")
+    if src in ("future", "bad_date", "bad_code", "empty"):
+        text = (
+            f"{src_emoji} {code} {name} · {result.get('date', '?')}\n"
+            f"  {result.get('env_level', '?')}"
+        )
+        return {"msg_type": "text", "content": {"text": text}}
+    close = result.get("close")
+    chg = result.get("chg_pct")
+    chg_amt = result.get("chg_amt")
+    turnover = result.get("turnover")
+    amount_yi = result.get("amount_yi")
+    amplitude = result.get("amplitude")
+    high = result.get("high")
+    low = result.get("low")
+    open_p = result.get("open")
+    date_str = result.get("date", "?")
+    req_date = result.get("requested_date")
+    date_label = date_str
+    if req_date and req_date != date_str:
+        date_label = f"{date_str} (问 {req_date}, 该日无数据, 取最近交易日)"
+    # chg 用 + 标识涨/跌
+    chg_str = f"{chg:+.2f}%" if chg is not None else "?"
+    chg_amt_str = f"{chg_amt:+.2f}元" if chg_amt is not None else "?"
+    text = (
+        f"{src_emoji} {code} {name} \u00b7 {date_label}\n"
+        f"  \u6536\u76d8: {close} ({chg_str}, {chg_amt_str})\n"
+        f"  \u5f00/\u9ad8/\u4f4e: {open_p} / {high} / {low}\n"
+        f"  \u632f\u5e45: {amplitude}%\n"
+        f"  \u6210\u4ea4\u989d: {amount_yi}\u4ebf\n"
+        f"  \u6362\u624b: {turnover}%"
+    )
+    return {"msg_type": "text", "content": {"text": text}}
+
+
 def _run_get_stage_runs(args: dict[str, Any]) -> dict[str, Any]:
     target_date: str | None = args.get("date")
     if not target_date:
@@ -323,7 +442,7 @@ def _build_explain_query(pick: dict[str, Any]) -> str:
 
 def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
     from ..llm.reasoner import answer_question, retrieve
-    code: str = args.get("code", "").strip()
+    code: str = (args or {}).get("code", "").strip()
     if not code:
         return {"code": code, "explanation": "（请提供股票代码）"}
     conn = get_db()
@@ -333,41 +452,57 @@ def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
         (code,),
     ).fetchone()
     if not row:
-        # v12.9.1: picks 找不到 → 拉实时行情兜底
-        from .data_fetcher import fetch_realtime_quote
-        quote = fetch_realtime_quote(code)
-        if not quote:
-            return {
-                "code": code,
-                "explanation": (
-                    f"这只票 ({code}) 不在我的选股记录里, 我也没拉到实时数据。\n\n"
-                    f"你可以试试:\n"
-                    f"1. 说股票名 (例 '茅台怎么样') 或完整 6 位代码\n"
-                    f"2. 我帮你从选股记录 / 知识库找"
-                ),
-                "source": "fallback_empty",
-            }
-        # 实时拉到 → 让 LLM 用实时数据给一句话解释
-        name = quote.get("name") or code
-        price = quote.get("price")
-        chg = quote.get("chg_pct")
-        turnover = quote.get("turnover")
-        mktcap = quote.get("mktcap_yi")
-        # 拼事实给 LLM
-        facts = f"{name}({code}) 最新价 {price}, 今日 {chg}%, 换手 {turnover}%, 总市值 {mktcap}亿"
+        # v12.A.1: 优先用 date 拉 K 线 (治 "禾望电气周五行情" 类)
+        from .data_fetcher import fetch_stock_kline, fetch_realtime_quote
+        kline_date = (args or {}).get("date")
+        kline = fetch_stock_kline(code, kline_date) if kline_date else {}
+        if not kline or not kline.get("close"):
+            # 没 date 或 K 线拉不到 → 走实时
+            kline = fetch_realtime_quote(code)
+            if not kline:
+                return {
+                    "code": code,
+                    "explanation": (
+                        f"这只票 ({code}) 不在我的选股记录里, 我也没拉到行情数据。\n\n"
+                        f"你可以试试:\n"
+                        f"1. 说股票名 (例 '茅台怎么样') 或完整 6 位代码\n"
+                        f"2. 我帮你从选股记录 / 知识库找"
+                    ),
+                    "source": "fallback_empty",
+                }
+        # K 线/实时 拉到 → 让 LLM 用数据给一句话解释
+        name = kline.get("name") or code
+        if "close" in kline and kline.get("date"):
+            # K 线数据 (有 date 字段)
+            price = kline.get("close")
+            chg = kline.get("chg_pct")
+            chg_amt = kline.get("chg_amt")
+            turnover = kline.get("turnover")
+            amount_yi = kline.get("amount_yi")
+            k_date = kline.get("date")
+            data_tag = f"[数据源: 东方财富K线 · {k_date}]"
+            facts = f"{name}({code}) {k_date} 收盘 {price}元, 涨跌 {chg}% ({chg_amt:+.2f}元), 换手 {turnover}%, 成交额 {amount_yi}亿"
+        else:
+            # 实时数据
+            price = kline.get("price")
+            chg = kline.get("chg_pct")
+            turnover = kline.get("turnover")
+            mktcap = kline.get("mktcap_yi")
+            data_tag = "[数据源: 东方财富实时]"
+            facts = f"{name}({code}) 最新价 {price}, 今日 {chg}%, 换手 {turnover}%, 总市值 {mktcap}亿"
         explanation = answer_question(
             question=f"用大白话一句话说说 {facts}, 给小白用户看 (≤ 100 字)",
             recent_picks=[],
             market_env={},
         )
-        explanation = (explanation or "（实时数据已拉到, LLM 暂不可用）").rstrip()
-        explanation += "\n\n[数据源: 东方财富实时]"
+        explanation = (explanation or "（行情数据已拉到, LLM 暂不可用）").rstrip()
+        explanation += f"\n\n{data_tag}"
         return {
             "code": code,
             "name": name,
             "explanation": explanation,
-            "source": "realtime",
-            "quote": quote,
+            "source": "kline" if "close" in kline else "realtime",
+            "quote": kline,
         }
     pick = dict(row)
 
@@ -433,7 +568,7 @@ def _render_explain_card(result: dict[str, Any]) -> dict[str, Any]:
     explanation = _strip_think(result.get("explanation", ""))
     sources = result.get("rag_sources") or result.get("sources") or []
     # v12.9.1: 改用 interactive card
-    from ..feishu.card_templates import card_explain
+    from .cards import card_explain
     card = card_explain(
         code=result.get("code", "?"),
         name=result.get("name", ""),
@@ -585,6 +720,30 @@ SKILL_REGISTRY: dict[str, Skill] = {
         run=_run_get_market_env,
         render_to_card=_render_market_env_card,
     ),
+    "get_stock_quote": Skill(
+        name="get_stock_quote",
+        description="查询个股某日行情 (开高低收/涨跌/换手)。需要 code, 可选 date。",
+        uses_llm=False,
+        schema={
+            "type": "function",
+            "function": {
+                "name": "get_stock_quote",
+                "description": "查询个股某日 K 线行情 (东方财富 push2his.kline)。"
+                               " 必须传 code (6 位); 可选 date=YYYY-MM-DD (默认今天)。"
+                               " 治 '禾望电气周五行情' 类: 周五=6-12 时返 6-12 收盘价, 不幻觉。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "6 位股票代码"},
+                        "date": {"type": "string", "description": "YYYY-MM-DD 或 'today' (默认今天)"},
+                    },
+                    "required": ["code"],
+                },
+            },
+        },
+        run=_run_get_stock_quote,
+        render_to_card=_render_stock_quote_card,
+    ),
     "get_stage_runs": Skill(
         name="get_stage_runs",
         description="查询某日已跑的 stage 列表 (stage_runs 表)。",
@@ -677,11 +836,13 @@ SKILL_REGISTRY: dict[str, Skill] = {
 # 关键词降级路径 (LLM 不可用时)
 # 按"最具体优先"排序, 命中第一个返回 skill 名
 _KEYWORD_FALLBACK: list[tuple[list[str], str]] = [
-    # v12.9: 知识库关键词放最前 (最具体优先)
+    # v12.A.1: 优先级: 知识库 > 个股 (含 6 位代码) > 持仓 > 选股 > 大盘 > 阶段 > 回测
+    #          治 "今日持仓" 截胡到 get_picks; 治 "它今天行情" 漏到 get_market_env
     (["缠论", "缠中说禅", "108课", "108 课", "好运2008", "好运 2008", "苏三", "知识库", "知识", "教材", "理论", "心法"], "search_knowledge"),
+    (["持仓", "positions", "开了什么", "现在有什么", "仓位", "我的股"], "get_positions"),
+    (["个股", "股价", "股票", "这个股", "这个票", "只股", "只票"], "explain_pick"),
     (["picks", "选股", "今日选股", "今日推荐", "today", "今日"], "get_picks"),
-    (["持仓", "positions", "开了什么", "现在有什么"], "get_positions"),
-    (["日报", "daily", "今日战况", "今日怎么样"], "get_daily_report"),
+    (["日报", "daily", "今日战况", "今日复盘"], "get_daily_report"),
     (["大盘", "市场环境", "env", "市场怎么样", "大盘怎么样", "行情", "市场行情", "盘面"], "get_market_env"),
     (["阶段", "跑了", "stage_runs", "今天跑了什么"], "get_stage_runs"),
     (["回测", "backtest", "复盘"], "backtest"),
@@ -745,17 +906,37 @@ def _parse_relative_date(text: str) -> str | None:
     return None
 
 
+_STOCK_CODE_RE = re.compile(r"\b\d{6}\b")  # 6 位代码 (沪 6xxxxx, 深 0xxxxx, 北 4/8xxxxx)
+
+
 def keyword_fallback(text: str) -> str | None:
-    """LLM 不可用时, 按关键词挑一个只读 skill 名
+    """v12.A.1: LLM 不可用时, 按优先级挑一个 skill
 
-    只命中 5 个只读 skill + backtest, 不命中返回 None
-    (避免 2 个 LLM skill 在降级路径被错误激活)。
-
-    v12.A: 仅返 skill 名 (date 解析由 dispatch 路径负责, keyword 阶段不传参)
+    优先级 (v12.A.1):
+      1) 含 6 位股票代码 (\d{6}) → get_stock_quote (有 date 时) 或 explain_pick
+      2) 知识库关键词 → search_knowledge
+      3) 持仓/仓位关键词 → get_positions  (提前到选股前面, 治 "今日持仓" 截胡)
+      4) "个股/股价/股票/这个股" → explain_pick
+      5) 选股/今日/picks → get_picks
+      6) 日报/复盘 → get_daily_report
+      7) 大盘/行情/市场 → get_market_env  (没标的)
+      8) 阶段 → get_stage_runs
+      9) 回测/复盘 → backtest
     """
     if not text:
         return None
     t = text.lower()
+
+    # 1) 6 位代码 → 个股 skill
+    m = _STOCK_CODE_RE.search(t)
+    if m:
+        code = m.group()
+        # 有 date / 行情 词 → get_stock_quote (拉 K 线); 否则 explain_pick (解释/RAG)
+        if any(kw in t for kw in ["行情", "价", "k线", "涨跌"]) or _parse_relative_date(t):
+            return "get_stock_quote"
+        return "explain_pick"
+
+    # 2-N) 顺序匹配 _KEYWORD_FALLBACK
     for keywords, skill_name in _KEYWORD_FALLBACK:
         if any(kw in t for kw in keywords):
             return skill_name

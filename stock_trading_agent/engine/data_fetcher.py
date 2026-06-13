@@ -14,7 +14,7 @@ import os
 import re
 import subprocess
 import time
-from datetime import date, timedelta
+from datetime import date as _date, timedelta  # v12.A.2: 别名防参数 shadow
 from pathlib import Path
 from typing import Any, Optional
 
@@ -218,7 +218,7 @@ _A_SHARE_HOLIDAYS_2026: set[str] = {
 
 def is_trading_day(ref_date: Optional[date] = None) -> bool:
     """判断 A 股交易日: weekday < 5 (Mon-Fri) 且不在法定节假日"""
-    d = ref_date or date.today()
+    d = ref_date or _date.today()
     if d.weekday() >= 5:
         return False
     if d.isoformat() in _A_SHARE_HOLIDAYS_2026:
@@ -227,7 +227,7 @@ def is_trading_day(ref_date: Optional[date] = None) -> bool:
 
 
 def get_latest_trading_day(ref_date: Optional[date] = None) -> date:
-    d = ref_date or date.today()
+    d = ref_date or _date.today()
     if d.weekday() == 5:
         return d - timedelta(days=1)
     if d.weekday() == 6:
@@ -236,7 +236,7 @@ def get_latest_trading_day(ref_date: Optional[date] = None) -> date:
 
 
 def get_previous_trading_day(ref_date: Optional[date] = None) -> date:
-    d = ref_date or date.today()
+    d = ref_date or _date.today()
     if d.weekday() == 0:
         return d - timedelta(days=3)
     if d.weekday() in (5, 6):
@@ -299,6 +299,101 @@ def fetch_realtime_quote(code: str, config: Optional[dict[str, Any]] = None) -> 
             "volume_ratio": _safe_float(d.get("f10")),
             "mktcap_yi": _safe_float(d.get("f20")),  # 总市值(亿)
             "source": "东方财富实时",
+        }
+    except Exception:
+        return {}
+
+
+def fetch_stock_kline(code: str, date: str | None = None,
+                   config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """v12.A.1: 个股某日 K 线 (东方财富 push2his.kline, 治 '禾望电气周五行情' 类)
+
+    接口: push2his.eastmoney.com /api/qt/stock/kline/get
+    字段: f51=日期 f52=开 f53=收 f54=高 f55=低 f56=成交量(手) f57=成交额(元)
+          f58=振幅(%) f59=涨跌幅(%) f60=涨跌额(元) f61=换手率(%)
+
+    date=None 或 'today' → 返最近 1 根 (今天/最近交易日)
+    date='YYYY-MM-DD' → 在 1 年日 K 里精确匹配该日那根
+    失败 (代码错/网络挂/节假日无数据) → 返空 dict
+
+    返 {code, name, date, open, close, high, low, chg_pct, chg_amt,
+         volume, amount_yi, amplitude, turnover}
+    """
+    if not code or len(code) != 6 or not code.isdigit():
+        return {}
+    try:
+        cfg = config or load_config()
+        # push2his 是 push2delay 的兄弟域名, 同 family, 不需额外配置
+    except Exception:
+        cfg = {}
+    secid = _build_secid(code)
+
+    # v12.A.2 修: 形参 date (str) shadow import 的 date class → AttributeError 'str' has no attribute 'today'
+    # 改: 用 _date (import alias) 调 class 方法
+    end_date = date if (date and date != "today") else _date.today().isoformat()
+    try:
+        end_dt = _date.fromisoformat(end_date)
+        beg_dt = end_dt - timedelta(days=365)
+    except ValueError:
+        return {}
+    beg_str = beg_dt.strftime("%Y%m%d")
+    end_str = end_dt.strftime("%Y%m%d")
+
+    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
+    params = {
+        "secid": secid,
+        "fields1": "f1,f2,f3,f4,f5,f6",
+        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
+        "klt": "101",         # 日 K
+        "fqt": "1",           # 前复权
+        "beg": beg_str,
+        "end": end_str,
+        "lmt": "1000",
+    }
+    try:
+        text = curl_get(url + "?" + urlencode(params))
+        if not text:
+            return {}
+        import json as _json
+        data = _json.loads(text)
+        if not data or str(data.get("rc", "")) not in ("0", ""):
+            return {}
+        d = data.get("data") or {}
+        klines = d.get("klines") or []
+        if not klines:
+            return {}
+        target_date = end_date  # 'today' 走 end_date
+        # 1) 精确匹配 date
+        # 2) 没匹配 → 返最后一根 (用户问 today 但接口返的是最近一个交易日)
+        matched = None
+        if date and date != "today":
+            for line in klines:
+                parts = line.split(",")
+                if parts and parts[0] == target_date:
+                    matched = parts
+                    break
+        if not matched:
+            matched = klines[-1].split(",")
+        if len(matched) < 11:
+            return {}
+        # 字段顺序: 日期,开,收,高,低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
+        name = d.get("name", "")
+        amount_yuan = _safe_float(matched[6])  # 元
+        return {
+            "code": d.get("code", code),
+            "name": name,
+            "date": matched[0],
+            "open": _safe_float(matched[1]),
+            "close": _safe_float(matched[2]),
+            "high": _safe_float(matched[3]),
+            "low": _safe_float(matched[4]),
+            "volume": _safe_float(matched[5]),       # 手
+            "amount_yi": (amount_yuan / 1e8) if amount_yuan else None,  # 转亿
+            "amplitude": _safe_float(matched[7]),
+            "chg_pct": _safe_float(matched[8]),
+            "chg_amt": _safe_float(matched[9]),
+            "turnover": _safe_float(matched[10]),
+            "source": "东方财富K线",
         }
     except Exception:
         return {}
@@ -648,7 +743,7 @@ def get_sector_momentum(days: int = 3, sectors_dir: Optional[Path] = None) -> di
 
     rising.sort(key=lambda x: x["total_chg"], reverse=True)
 
-    today_file = sectors_dir / f"sectors_{date.today().strftime('%Y%m%d')}.json"
+    today_file = sectors_dir / f"sectors_{_date.today().strftime('%Y%m%d')}.json"
     new_sectors: list[dict[str, Any]] = []
     rising_names = {r["name"] for r in rising}
     if today_file.exists():

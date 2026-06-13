@@ -31,3 +31,7 @@ stock_trading_agent/data/knowledge/chanlun/**
 .idea/
 .vscode/
 .DS_Store
+data/paper_trader.db
+
+# v12.A.2 dedup cache (runtime)
+data/dedup_seen.json

@@ -101,9 +101,17 @@ def stage_pre_market() -> dict[str, Any]:
 
 @_with_stage_run_logging("open_auction")
 def stage_open_auction() -> dict[str, Any]:
+    """v12.A.2: push_anomaly 异常吞掉 (推不动不能阻下游 pick)
+
+    历史: v12 之前 push_anomaly 抛异常 → open_auction 失败 → pick 依赖未跑 → picks 表空
+    修法: push 异常仅 log.warning, 不 raise; 后续 stage 不再被依赖图卡死
+    """
     opens = get_open_positions()
     if opens:
-        pusher.push_anomaly(f"今日开盘需关注 paper 持仓 {len(opens)} 只")
+        try:
+            pusher.push_anomaly(f"今日开盘需关注 paper 持仓 {len(opens)} 只")
+        except Exception as e:  # noqa: BLE001
+            log.warning("open_auction push_anomaly 失败 (忽略, 不阻下游): %s", e)
     return {"open_count": len(opens), "opens": opens}
 
 

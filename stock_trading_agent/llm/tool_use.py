@@ -265,6 +265,9 @@ def dispatch(
                 "error": None,
             }
 
+    # v12.A.1: 入口 1 次解析 date, 3 路径共享 (LLM tool / keyword_fallback / freeform 提示)
+    parsed_date = _parse_relative_date(text)
+
     # 拼系统 prompt + 上下文
     sys_prompt = _build_system_prompt(chat_id=chat_id)
     context_lines = []
@@ -322,8 +325,7 @@ def dispatch(
                 "raw": {},
                 "error": resp.get("error", "LLM unavailable"),
             }
-        # v12.A: 解析相对日期, 透传给 skill (主要是 get_market_env 接 date)
-        parsed_date = _parse_relative_date(text)
+        # v12.A.1: 复用 dispatch 入口的 parsed_date (避免重复解析)
         skill_args = {"date": parsed_date} if parsed_date else {}
         result = call_skill(skill_name, skill_args)
         _log_call("tool_use_dispatch", result.get("ok", False), 0,
@@ -341,6 +343,13 @@ def dispatch(
     # 2) LLM 成功, 检查 tool_calls
     tool_calls = resp.get("tool_calls", [])
     if not tool_calls:
+        # v12.A.1: freeform 路径把 date 拼到 messages (治 LLM hallucinate "周五" → 6-12)
+        if parsed_date:
+            messages = list(messages)
+            messages.insert(1, {
+                "role": "system",
+                "content": f"[时间提示] 用户文本中提到的日期 → {parsed_date} (用此回答, 不再编造日期)"
+            })
         # LLM 选了不调 tool → 自由回答 (兼容老 chat_with_session 行为)
         raw_content = resp.get("content", "").strip()
         content = _strip_think_tags(raw_content)

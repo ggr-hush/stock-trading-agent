@@ -127,6 +127,10 @@ def handle(text: str, sender_id: str, chat_id: str,
         return call_skill("get_market_env", {}).get("card") or {"msg_type": "text", "content": {"text": "(无结果)"}}
     if cmd == "/status":
         return _status_payload()
+    if cmd == "/stage":
+        return _stage_payload()
+    if cmd == "/health":
+        return _health_payload()
     if cmd == "/reset":
         return _reset_session(chat_id)
     return {"msg_type": "text", "content": {"text": f"未知命令: {cmd} (打 /help 看支持列表)"}}

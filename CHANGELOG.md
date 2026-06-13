@@ -2,6 +2,128 @@
 
 本项目所有重要变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v12.A.2] - 2026-06-13
+
+### Fixed (体验优化包: 5 改 1 包 + 1 顺手)
+- **🐛 BUG 修: `/stage` `/health` 命令已接通** (feishu/admin_cmd.py)
+  - 之前 v12.9.2 写好 `_stage_payload` `_health_payload` 但漏接 `handle()` 分发, 返 '未知命令'
+  - 改: handle() 末尾加 2 行 `if cmd == "/stage": return _stage_payload()` / `if cmd == "/health": ...`
+  - 测试: test_admin_stage_cmd + test_admin_health_cmd + test_admin_help_lists_all_7
+
+- **⭐ 持仓卡片丰富** (engine/cards.py)
+  - 新增 `_bar(pct)`: 盈亏柱 (🟩/🟥 + ▇ unicode 块)
+  - `card_positions` 增强: 每只票加 `持仓天数` (从 pick_date 算到 today)
+  - 末尾加 `板块分布` 汇总 (按 sector 统计数量 + 平均盈亏)
+  - 顺手: feishu/card_templates.py 改名迁移 → engine/cards.py (名实相符, 工厂跟 engine 同侧)
+  - skills.py 3 个 import 改 `from .cards import ...`
+  - 测试: test_cards_bar_positive/negative/zero + test_cards_position_holding_days + test_cards_position_with_sector_and_days
+
+- **⭐ picks 表空修复 (open_auction push 异常吞掉)** (agent/stages.py)
+  - 根因: `pusher.push_anomaly` 失败 → open_auction stage 失败 → pick 依赖检查失败 → pick 永远没跑 → picks 表空
+  - 改: `stage_open_auction` 内部把 `push_anomaly` 包 try/except, 失败仅 log.warning
+  - 不动 RETRYABLE_STAGES (保留 v12.9.2 分类: open_auction 仍是非关键 stage)
+  - 测试: test_open_auction_push_fail_does_not_raise + test_open_auction_not_in_retryable_stages
+
+- **🧹 dedup cache 跨进程持久** (feishu/listener.py)
+  - 之前: `_seen_msgs` in-memory, agent 重启全丢
+  - 现在: 每 30 次 `_mark_seen` 写一次 `data/dedup_seen.json`; 启动时 `_load_seen_from_disk()` 恢复
+  - TTL 600s 过期自动清 (避免文件无限增长)
+  - 测试: test_dedup_load_from_disk_empty / with_data + test_dedup_mark_seen_writes_to_disk_every_30
+
+- **🧹 清理历史遗留空文件** (.gitignore)
+  - `data/paper_trader.db` (0 bytes, 22:43 创建没人写) 实际无引用 (DB_PATH 指 `stock_trading_agent/data/quant.db`)
+  - 加 `data/paper_trader.db` 到 .gitignore
+  - 注: sandbox 跑 `git rm --cached` 需要 Mac 端跑, 同步见 Migration
+
+### 架构清理 (this PR)
+- 单一卡片工厂路径: feishu/card_templates.py (跨 boundary) → engine/cards.py (名实相符)
+- dedup 单一文件位置: data/dedup_stats.json (counter) + data/dedup_seen.json (cache) 都在 data/
+- skills.py import 3 处收敛到 `from .cards import`
+
+### Migration
+- 重启 supervisor 生效: `bash deploy/install_launchd.sh restart`
+- Mac 端跑 (sandbox git index lock):
+  ```
+  git rm --cached data/paper_trader.db
+  git add -A && git commit -m "v12.A.2 体验优化包"
+  ```
+
+### Tests
+- `tests/test_v12_a_2.py` 27 个 (admin BUG 5 + cards 增强 7 + stages 2 + dedup 3 + gitignore 1 + 回归 3 + **date shadow regression 4** + **picks empty UX 2**)
+- 跑回归: 12 个套件 (v12.5.1 dedup + v12.8 supervisor/dedup/freeform/persona + v12.9.1/2/3 + v12.9_rag + v12.A market_env/stock_quote + v12.A.2) 全过
+- v12.9.2 套件 7/7 不退化 (验证 RETRYABLE_STAGES 没动)
+
+### Hotfix-2 (v12.A.2 收尾 — picks empty UX)
+- **问题**: 用户问 '今日选股' / '禾望电气为什么没入选' → picks 表 0 行 → 返 '(无选股记录)', 用户不知道为啥没
+- **根因**:
+  1. picks 表 0 行的真因是 stage_pick 还没到 cron 时间 (14:00), catch_up 不会补跑未来时间
+  2. 但 UX 上不告诉用户原因, 只说"无选股记录" → 答非所问
+- **修法** (engine/skills.py):
+  - `_run_get_picks`: picks 空时查 `stage_runs` 表, 返 `empty_reason` 字段 (3 种)
+    - stage 还没跑 → "今天 ( YYYY-MM-DD ) pick stage 还没跑 (计划 14:00 跑)"
+    - stage 跑了但失败 → "今天 pick stage 跑失败 ( 时间 ), 详见 /stage"
+    - stage 跑了但没出候选 → "今天 pick 跑过但没出候选 (大盘/筛选太严)"
+  - `_render_picks_card`: picks 空时用 `empty_reason` 拼 "📭 {reason}" 卡片
+- **回归测试** (test_v12_a_2.py 新加 2 个):
+  - test_get_picks_empty_shows_stage_reason
+  - test_get_picks_with_items_unchanged
+- **Mac 端验证**: 必须先 `bash deploy/install_launchd.sh restart` 让 picks UX 改的代码生效, 旧 agent 进程 (pid 4519) 还跑着 v12.A.2 改前代码
+
+### Hotfix (v12.A.2 收尾 — date shadow BUG)
+- **根因**: `engine/data_fetcher.py:fetch_stock_kline` 形参 `date: str` 跟 module-level `from datetime import date` 同名 → Python 解释器优先解析为形参 str, 导致 `date.today()` 实际是 `str.today()` → `AttributeError: 'str' object has no attribute 'today'`
+- **影响**: get_stock_quote / explain_pick 走 K 线分支时必炸 (mac 端真实跑东方财富才暴露, sandbox mock 测不出)
+- **修法**:
+  - `from datetime import date, timedelta` → `from datetime import date as _date, timedelta`
+  - fetch_stock_kline 内 `date.today()` / `date.fromisoformat()` → `_date.today()` / `_date.fromisoformat()`
+  - 其他 4 处 `date.today()` (is_trading_day / get_latest_trading_day / get_previous_trading_day / get_market_sector_change_rising) 同步改 `_date.today()` (虽然没 shadow, 统一风格防踩)
+- **回归测试** (test_v12_a_2.py 新加 4 个):
+  - test_fetch_stock_kline_no_date_shadow: date='today' 不抛
+  - test_fetch_stock_kline_date_str_shadow: date='2026-06-12' 不抛
+  - test_data_fetcher_date_alias_in_globals: _date is datetime.date
+  - test_is_trading_day_uses_date_alias: 默认参不抛
+
+## [v12.A.1] - 2026-06-13
+
+### Fixed (治 "禾望电气周五行情" 类 + 架构合并)
+- **`fetch_stock_kline(code, date)` 新增** (engine/data_fetcher.py)
+  - 调东方财富 push2his.eastmoney.com/api/qt/stock/kline/get
+  - 返 11 字段: date/open/close/high/low/volume/amount_yi/amplitude/chg_pct/chg_amt/turnover
+  - 支持 date=YYYY-MM-DD 回看历史日 (push2 跟 push2delay 是兄弟域名, 同 family)
+- **`get_stock_quote` skill 新增** (engine/skills.py)
+  - SKILL_REGISTRY 第 9 个 skill, uses_llm=False, schema 含 code (required) + date (optional)
+  - 6 个分支: 未来/格式错/代码错/空数据/K线拉到/没date走实时
+- **`_run_explain_pick` picks 找不到分支改 K 线/实时** (engine/skills.py)
+  - 优先用 args.date 拉 K 线, 没 date 或拉不到 → 走 fetch_realtime_quote
+  - 末尾 source 区分 'kline' / 'realtime' (前端能看到数据源)
+- **`keyword_fallback` 改 v12.A.1 优先** (engine/skills.py)
+  - 1) 6 位代码 regex → get_stock_quote (有'行情') 或 explain_pick
+  - 2) 持仓关键词提前到选股前面 (治 "今日持仓" 截胡到 get_picks)
+  - 3) 新增 "个股/股价/股票/这个股" 触发 explain_pick
+- **`dispatch` 入口 1 个 date 解析点** (llm/tool_use.py)
+  - 旧: 3 个路径各调 1 次 _parse_relative_date
+  - 新: 入口解析 1 次, 3 路径共享; freeform 路径把 date 拼到 messages (治 LLM 自由回答 hallucinate "周五" → 6-12)
+- **persona boundary_rules +3 条** (config/persona.yaml)
+  - "用户提到某只具体票 (6 位代码/股票名) + 任何时间 → 必调 get_stock_quote/explain_pick, 不要当市场行情"
+  - "代词 (它/这只/他) → 翻 sessions 找最近 code, 找不到就主动追问"
+  - "日期 (今天/周五/11-07) 是 query 的 date 参数, 不再凭印象编"
+- **修 `_render_explain_card` think 剥除测试** (tests/test_v12.py)
+  - v12.9.1 改 interactive card 后老测试 r["content"]["text"] 找不到
+  - 改测试适配 r["content"]["elements[0].text.content"]
+
+### 架构合并 (this PR)
+- date 解析 1 个入口 (替代 3 处重复调用)
+- 持仓关键词前置 (治 "今日持仓" 截胡老 bug, v12.9.1 已知遗留)
+- 6 位代码 regex 直路由 (替代 LLM hallucinate "持仓" 误判)
+- 真实存在的接口 (push2his.kline) 现在用上 (之前 Hermes 时代能用)
+
+### Migration
+- 无 schema 改动
+- 重启 supervisor 生效: `bash deploy/install_launchd.sh restart`
+
+### Tests
+- `tests/test_v12_a_1_stock_quote.py` 11 个 (fetch_stock_kline 3 + _run_get_stock_quote 2 + _render 2 + keyword 2 + schema 1 + explain_pick 1)
+- 修 `test_v12.py: test_skill_explain_strips_think` 适配 interactive card 结构
+- 全套件回归通过 (23 个套件, 285/286, 仅 tuner 1 个 pre-existing fail)
 ## [v12.A] - 2026-06-13
 
 ### Fixed (治 LLM "截止最新运行日" hallucinate)
