@@ -240,7 +240,7 @@ def dispatch(
           "error": str | None,
         }
     """
-    from ..engine.skills import tool_schemas, call_skill, keyword_fallback
+    from ..engine.skills import tool_schemas, call_skill, keyword_fallback, _parse_relative_date
 
     if not text or not text.strip():
         return {"ok": False, "path": "empty", "card": _empty_card("（空消息）"),
@@ -322,9 +322,12 @@ def dispatch(
                 "raw": {},
                 "error": resp.get("error", "LLM unavailable"),
             }
-        result = call_skill(skill_name, {})
+        # v12.A: 解析相对日期, 透传给 skill (主要是 get_market_env 接 date)
+        parsed_date = _parse_relative_date(text)
+        skill_args = {"date": parsed_date} if parsed_date else {}
+        result = call_skill(skill_name, skill_args)
         _log_call("tool_use_dispatch", result.get("ok", False), 0,
-                  tool_name=skill_name, tool_args="{}", chat_id=chat_id,
+                  tool_name=skill_name, tool_args=json.dumps(skill_args, ensure_ascii=False)[:80], chat_id=chat_id,
                   error=result.get("error"))
         return {
             "ok": result.get("ok", False),

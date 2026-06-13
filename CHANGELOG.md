@@ -2,6 +2,56 @@
 
 本项目所有重要变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v12.A] - 2026-06-13
+
+### Fixed (治 LLM "截止最新运行日" hallucinate)
+- **`_run_get_market_env` 接 `date` 参数** (engine/skills.py)
+  - 之前: 不接受日期, picks 表空 → 实时拉, picks 表非空 → 取最近一行
+  - 现在: 接受 `date=YYYY-MM-DD` / `date="today"`, 6 个分支:
+    - 未来日 → "未开盘 (未来日)" 友好提示
+    - 周末/节假日 → "X周X不开盘 (周末/节假日)"
+    - 过去交易日 + picks 无数据 → "历史数据暂无 (picks 表当日为空)"
+    - 过去交易日 + picks 有 → 用 picks
+    - 今天 + picks 无 → 实时拉 (v12.5.1 老逻辑)
+    - 格式错 → "日期格式错 (要 YYYY-MM-DD)"
+  - 治用户问"周五行情" → 模型不再瞎编"截止最新运行日 11-04"
+- **`_parse_relative_date` helper** (engine/skills.py)
+  - 解析 "今天/今天/昨天/明天" + "周X" (默认推下一个, 显式下X/上X 推对应周) + "YYYY-MM-DD" + "MM-DD" (默认本年)
+  - dispatch keyword_fallback 路径透传给 `call_skill(args={"date": "..."})`
+- **keyword_fallback 触发词** 加 "行情" / "市场行情" / "盘面"
+- **`get_market_env` tool schema description** 教 LLM: 支持 date 参数, 未来/周末/过去无数据 返明确文案, 不瞎编
+- **persona.yaml boundary_rules** +2 条: 涉及日期+行情必须调 get_market_env; 不要编造"数据截止日"
+
+### Migration
+- 无 schema 改动 (老 .db 兼容)
+- 重启 supervisor 生效: `agent stop && agent start`
+
+### Tests
+- `tests/test_v12_a_market_env.py` 17 个
+  - 7 个 _parse_relative_date (今天/昨天/明天/周X推未来/下周一/上周五/3段日期/2段日期/无日期)
+  - 6 个 _run_get_market_env (未来日/过去无picks/过去有picks/今天非交易日/格式错/无参实时拉)
+  - 2 个 keyword_fallback (新触发词 + 不冲突)
+  - 1 个 tool schema 校验
+  - 1 个 dispatch keyword_fallback 集成 (验 date 透传)
+
+## [v12.9.3] - 2026-06-13
+
+### Fixed (picks 找到时也拉实时)
+- **`_run_explain_pick` picks 找到分支补拉实时行情** (engine/skills.py)
+  - 之前: picks 表找到 → 只走 RAG + picks 历史数据 → 用户问"实时"时 bot 用 RAG 知识答, 体感"实时拿不到"
+  - 现在: picks 找到时也调 `fetch_realtime_quote(code)` (容错, 失败不影响)
+  - 实时数据叠加进 LLM prompt (作为 fact: 价/涨跌幅/换手/市值)
+  - 末尾追加 `[实时 N 元 · 今日 N% · 换手 N%]` 一行, 让用户明确看到 bot 用了实时
+- **fallback_empty 文案**: 保留, 不变
+
+### Migration
+- 无 (单函数内部加 ~15 行)
+- 重启 supervisor 生效: `agent stop && agent start`
+
+### Tests
+- `tests/test_v12_9_3_realtime.py` 2 个
+- 273/274 通过 (tuner 1 个 pre-existing fail 不动)
+
 ## [v12.9.2] - 2026-06-13
 
 ### Added (运维包: 仪表盘 + 可观测 + retry)

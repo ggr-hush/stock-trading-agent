@@ -1,0 +1,49 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>Label</key>
+    <string>com.stockagent</string>
+
+    <!-- 直接调 .venv/bin/python, 绕开 bash wrapper -->
+    <key>ProgramArguments</key>
+    <array>
+        <string>/Users/alice/Documents/Codex/stock-trading-agent/.venv/bin/python</string>
+        <string>-m</string>
+        <string>stock_trading_agent.agent</string>
+        <string>start</string>
+    </array>
+
+    <key>RunAtLoad</key>
+    <true/>
+
+    <key>KeepAlive</key>
+    <dict>
+        <key>SuccessfulExit</key>
+        <false/>
+        <key>Crashed</key>
+        <true/>
+    </dict>
+
+    <key>ThrottleInterval</key>
+    <integer>10</integer>
+
+    <key>StandardInPath</key>
+    <string>/dev/null</string>
+    <key>StandardOutPath</key>
+    <string>/tmp/agent_launchd.out.log</string>
+    <key>StandardErrorPath</key>
+    <string>/tmp/agent_launchd.err.log</string>
+
+    <key>WorkingDirectory</key>
+    <string>/Users/alice/Documents/Codex/stock-trading-agent</string>
+
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>PYTHONPATH</key>
+        <string>/Users/alice/Documents/Codex/stock-trading-agent</string>
+        <key>PATH</key>
+        <string>/Users/alice/Documents/Codex/stock-trading-agent/.venv/bin:/usr/local/bin:/usr/bin:/bin</string>
+    </dict>
+</dict>
+</plist>

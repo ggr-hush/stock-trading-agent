@@ -275,7 +275,7 @@ def _make_handler(client, get_config):
         # v12.5.1: message_id 去重 (lark-oapi 5xx / reconnect 重投同一事件)
         # v12.8: 升级 warning + 写 bot_sessions system note + 计数器 +1
         if not _mark_seen(message_id):
-            log.warning("dup skip: chat=%s msg=%s text=%r",
+            log.info("dup skip: chat=%s msg=%s text=%r",
                         chat_id, message_id, text[:60])
             _record_dup_skip(chat_id, message_id, text)
             return

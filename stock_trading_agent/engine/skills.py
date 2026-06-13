@@ -17,7 +17,7 @@ from dataclasses import dataclass
 from datetime import date
 from typing import Any, Callable
 
-from .data_fetcher import load_config
+from .data_fetcher import load_config, is_trading_day, get_market_env
 from .paper_trader import get_db
 from .reviewer import backtest_multi
 from . import knowledge
@@ -151,16 +151,75 @@ def _render_daily_report_card(result: dict[str, Any]) -> dict[str, Any]:
     return {"msg_type": "text", "content": {"text": text}}
 
 
-def _run_get_market_env(_args: dict[str, Any]) -> dict[str, Any]:
-    """v12.5.1: picks 表空时 (周末/假期) 实时拉一次大盘兜底
+def _run_get_market_env(args: dict[str, Any]) -> dict[str, Any]:
+    """v12.A: 接 date 参数, 治 LLM '截止最新运行日' hallucinate
 
-    优先级: picks 表 (历史选股时算的 env) > data_fetcher 实时拉 > 失败提示
+    优先级:
+      1) date 显式传入 + picks 表有该日数据 → 用 picks
+      2) date 显式传入 + picks 表无 → 友好提示 (不瞎编)
+      3) date 未传 + picks 表非空 → 用最近一行 (向后兼容)
+      4) date 未传 + picks 空 → 实时拉 (v12.5.1 老逻辑)
+
+    date 语义:
+      YYYY-MM-DD (今天/过去日) | "today" (默认)
+      未来日 → 返 '未开盘'
+      周末/节假日 → 返 '不开盘'
+      过去交易日 + 无数据 → 返 '历史数据暂无'
     """
+    from datetime import date as _date, datetime as _dt
+    # 1) 解析 date 参数
+    #    没传 date → target_date=None, 跳过未来/非交易日检查, 走"最近一行 picks"或实时拉
+    #    date="today" → target_date=today, 走交易日判断
+    #    date="YYYY-MM-DD" → target_date=对应日
+    raw_date = (args or {}).get("date")
+    today = _date.today()
+    if raw_date is None or raw_date == "":
+        target_date: _date | None = None
+    elif raw_date == "today":
+        target_date = today
+    else:
+        try:
+            target_date = _dt.strptime(str(raw_date), "%Y-%m-%d").date()
+        except (ValueError, TypeError):
+            return {
+                "env_score": None,
+                "env_level": "日期格式错 (要 YYYY-MM-DD)",
+                "date": str(raw_date),
+                "source": "bad_date",
+            }
+
+    # 2) 未来日 → 未开盘 (明确告诉用户, 避免 LLM hallucinate)
+    if target_date and target_date > today:
+        return {
+            "env_score": None,
+            "env_level": "未开盘 (未来日)",
+            "date": target_date.isoformat(),
+            "source": "future",
+        }
+
+    # 3) 非交易日 → 周末/节假日
+    if target_date and not is_trading_day(target_date):
+        wd = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"][target_date.weekday()]
+        return {
+            "env_score": None,
+            "env_level": f"{wd}不开盘 (周末/节假日)",
+            "date": target_date.isoformat(),
+            "source": "non_trading_day",
+        }
+
+    # 4) 查 picks 表 (精确匹配 date 优先, 否则取最近一行)
     conn = get_db()
-    row = conn.execute(
-        "SELECT market_env_score, market_env_level, pick_date FROM picks "
-        "ORDER BY pick_date DESC, id DESC LIMIT 1"
-    ).fetchone()
+    if target_date:
+        row = conn.execute(
+            "SELECT market_env_score, market_env_level, pick_date FROM picks "
+            "WHERE pick_date = ? ORDER BY id DESC LIMIT 1",
+            (target_date.isoformat(),),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT market_env_score, market_env_level, pick_date FROM picks "
+            "ORDER BY pick_date DESC, id DESC LIMIT 1"
+        ).fetchone()
     if row:
         return {
             "env_score": row["market_env_score"],
@@ -169,8 +228,16 @@ def _run_get_market_env(_args: dict[str, Any]) -> dict[str, Any]:
             "source": "picks",
         }
 
-    # picks 空 (周末/假期/刚开项目) -> 实时拉一次
-    from datetime import date as _date
+    # 5) 过去交易日 + picks 无 → 明确说'历史数据暂无', 不瞎编截止日
+    if target_date and target_date < today:
+        return {
+            "env_score": None,
+            "env_level": "历史数据暂无 (picks 表当日为空)",
+            "date": target_date.isoformat(),
+            "source": "no_history",
+        }
+
+    # 6) date=today + picks 空 → 实时拉 (v12.5.1 老逻辑, 保持不变)
     try:
         from .data_fetcher import get_market_env as _fetch_env, load_config as _load_cfg
         cfg = _load_cfg()
@@ -178,7 +245,7 @@ def _run_get_market_env(_args: dict[str, Any]) -> dict[str, Any]:
         return {
             "env_score": env.get("env_score"),
             "env_level": env.get("env_level"),
-            "date": _date.today().isoformat(),
+            "date": today.isoformat(),
             "source": "realtime",
         }
     except Exception as e:  # noqa: BLE001
@@ -186,9 +253,12 @@ def _run_get_market_env(_args: dict[str, Any]) -> dict[str, Any]:
         return {
             "env_score": None,
             "env_level": "数据源不可用",
-            "date": _date.today().isoformat(),
+            "date": today.isoformat(),
             "source": "failed",
         }
+
+
+
 
 
 def _render_market_env_card(result: dict[str, Any]) -> dict[str, Any]:
@@ -301,6 +371,14 @@ def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
         }
     pick = dict(row)
 
+    # v12.9.3: picks 找到时也尝试拉一次实时 (容错, 失败不影响) — 用户问"实时"时也能答上
+    realtime: dict[str, Any] = {}
+    try:
+        from .data_fetcher import fetch_realtime_quote
+        realtime = fetch_realtime_quote(code)
+    except Exception:  # noqa: BLE001
+        realtime = {}
+
     # v12.9: 先 RAG 检索知识库, 把最相关 k 条来源注入 prompt, 末尾再标注 [来源]
     rag_query = _build_explain_query(pick)
     rag_results = retrieve(rag_query, k=5)
@@ -315,6 +393,16 @@ def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
             text_short = (r.get("text", "") or "").strip()[:20]
             rag_sources.append(f"{src_short}:{text_short}")
 
+    # v12.9.3: 实时价/涨跌 拼成 facts, 喂给 LLM
+    if realtime:
+        rt_facts = (
+            f"今日实时: {realtime.get('name') or code} "
+            f"最新价 {realtime.get('price')}, "
+            f"今日 {realtime.get('chg_pct')}%, "
+            f"换手 {realtime.get('turnover')}%, "
+            f"总市值 {realtime.get('mktcap_yi')}亿"
+        )
+        rag_query = f"{rag_query} | {rt_facts}"
     explanation = answer_question(
         question=rag_query,
         recent_picks=[pick],
@@ -324,9 +412,18 @@ def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
     # 末尾追加 [来源: ...], 即便 LLM 没在正文里标也能让用户知道用了哪些知识
     if explanation and rag_sources:
         explanation = explanation.rstrip() + "\n\n[来源] " + " / ".join(rag_sources)
+    # v12.9.3: 实时拉到 → 末尾追加 [实时数据: 价/涨跌] 一行, 让用户明确看到 bot 用了实时
+    if realtime and explanation:
+        rt_line = (
+            f"\n\n[实时 {realtime.get('price')} 元 · "
+            f"今日 {realtime.get('chg_pct')}% · "
+            f"换手 {realtime.get('turnover')}%]"
+        )
+        explanation = explanation.rstrip() + rt_line
     return {"code": code, "name": pick.get("name"),
             "explanation": explanation or "（LLM 暂不可用）",
-            "rag_sources": rag_sources}
+            "rag_sources": rag_sources,
+            "realtime": realtime}
     return {"code": code, "name": pick.get("name"),
             "explanation": explanation or "（LLM 暂不可用）",
             "rag_sources": rag_titles}
@@ -469,8 +566,20 @@ SKILL_REGISTRY: dict[str, Skill] = {
             "type": "function",
             "function": {
                 "name": "get_market_env",
-                "description": "查询大盘环境 (env_score / env_level)",
-                "parameters": {"type": "object", "properties": {}, "required": []},
+                "description": "查询大盘环境 (env_score / env_level)。"
+                               " 支持传 date=YYYY-MM-DD 回看历史日 (返友好提示, 不会编'截止日'幻觉);"
+                               " 传 date='today' 或省略 = 今天 (实时拉)。"
+                               " 未来日/周末/节假日/过去无数据日 都返明确文案, 不瞎编。",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "date": {
+                            "type": "string",
+                            "description": "目标日期 YYYY-MM-DD, 或 'today' (默认今天)",
+                        },
+                    },
+                    "required": [],
+                },
             },
         },
         run=_run_get_market_env,
@@ -573,10 +682,67 @@ _KEYWORD_FALLBACK: list[tuple[list[str], str]] = [
     (["picks", "选股", "今日选股", "今日推荐", "today", "今日"], "get_picks"),
     (["持仓", "positions", "开了什么", "现在有什么"], "get_positions"),
     (["日报", "daily", "今日战况", "今日怎么样"], "get_daily_report"),
-    (["大盘", "市场环境", "env", "市场怎么样", "大盘怎么样"], "get_market_env"),
+    (["大盘", "市场环境", "env", "市场怎么样", "大盘怎么样", "行情", "市场行情", "盘面"], "get_market_env"),
     (["阶段", "跑了", "stage_runs", "今天跑了什么"], "get_stage_runs"),
     (["回测", "backtest", "复盘"], "backtest"),
 ]
+
+
+_WEEKDAY_CN = ["周一", "周二", "周三", "周四", "周五", "周六", "周日"]
+
+
+def _parse_relative_date(text: str) -> str | None:
+    """v12.A: 解析 '周五' / '下周一' / '昨天' / '今天' → 'YYYY-MM-DD'
+
+    只解析 4 种; 解析不到返 None (让上游走默认 today)
+    """
+    import re
+    from datetime import date, timedelta
+
+    today = date.today()
+    t = text.strip()
+
+    if "今天" in t or "今日" in t:
+        return today.isoformat()
+    if "昨天" in t or "昨日" in t:
+        return (today - timedelta(days=1)).isoformat()
+    if "明天" in t or "明日" in t:
+        return (today + timedelta(days=1)).isoformat()
+
+    # 显式 2025-11-07 (3 段)
+    m = re.search(r"\b(20\d{2})-(\d{1,2})-(\d{1,2})\b", t)
+    if m:
+        try:
+            return date(int(m.group(1)), int(m.group(2)), int(m.group(3))).isoformat()
+        except ValueError:
+            return None
+    # 显式 11-07 (2 段, 默认本年)
+    m2 = re.search(r"\b(\d{1,2})-(\d{1,2})\b", t)
+    if m2:
+        try:
+            return date(today.year, int(m2.group(1)), int(m2.group(2))).isoformat()
+        except ValueError:
+            return None
+
+    # 周X: "下周五" 强推下周; "上周五" 强推上周; 单独 "周五" 默认下一个
+    for i, wd in enumerate(_WEEKDAY_CN):
+        if wd in t:
+            cur_wd = today.weekday()  # 0=Mon
+            diff = i - cur_wd
+            # 显式 "下周" / "下个周X" / "下X" → 至少下周
+            if "下周" in t or "下个" in t or "下" + wd in t:
+                if diff <= 0:
+                    diff += 7
+            # 显式 "上周" / "上X" → 至少上周
+            elif "上周" in t or "上个" in t or "上" + wd in t:
+                if diff >= 0:
+                    diff -= 7
+            else:
+                # 单独 "周五" → 默认下一个 (用户没指定过去)
+                if diff <= 0:
+                    diff += 7
+            return (today + timedelta(days=diff)).isoformat()
+    return None
 
 
 def keyword_fallback(text: str) -> str | None:
@@ -584,6 +750,8 @@ def keyword_fallback(text: str) -> str | None:
 
     只命中 5 个只读 skill + backtest, 不命中返回 None
     (避免 2 个 LLM skill 在降级路径被错误激活)。
+
+    v12.A: 仅返 skill 名 (date 解析由 dispatch 路径负责, keyword 阶段不传参)
     """
     if not text:
         return None

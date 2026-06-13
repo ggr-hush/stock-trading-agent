@@ -51,6 +51,7 @@ def _check_already_running() -> None:
     失败情形 (pid 文件存在但进程已死): 视为 stale, 删了重起
     """
     if not PID_FILE.exists():
+        log.info("[start] pid 文件不存在, 直接启动")
         return
     try:
         old_pid = int(PID_FILE.read_text().strip())
@@ -64,7 +65,7 @@ def _check_already_running() -> None:
     try:
         os.kill(old_pid, 0)
     except ProcessLookupError:
-        log.warning("[start] pid 文件存在但进程 %d 已死, 删除重起", old_pid)
+        log.info("[start] pid 文件存在但进程 %d 已死, 删除重起 (stale pid)", old_pid)
         try:
             PID_FILE.unlink()
         except OSError:
