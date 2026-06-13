@@ -135,6 +135,22 @@ def stage_pick() -> dict[str, Any]:
         pusher.push_pick(result)
     log.info("选股完成: 方案=%s, 候选=%d, 开仓=%d",
              result["plan_used"], len(result["filtered_stocks"]), n_open)
+    # v12.A.3: 写 SELECTED temporal fact (每只候选一条)
+    try:
+        from ..engine.temporal_facts import record
+        plan = result["plan_used"]
+        for stk in result.get("filtered_stocks", [])[:10]:
+            record(
+                subject=stk.get("code", "?"),
+                predicate="SELECTED",
+                object_=f"plan:{plan}",
+                claim=f"今日 {plan} 方案, 评分 {stk.get('score', 0):.1f}",
+                source="stage_pick",
+                score=stk.get("score", 0),
+                sector=stk.get("sector", ""),
+            )
+    except Exception as e:  # noqa: BLE001
+        log.warning("stage_pick 写 SELECTED fact 失败: %s", e)
     return {"plan": result["plan_used"], "n_open": n_open}
 
 
@@ -171,6 +187,21 @@ def stage_post_market() -> dict[str, Any]:
     filled_count = sum(1 for p in picks_with_status if p["is_filled"])
     pusher.push_post_market(filled_count, "模拟成交", picks_with_status)
     log.info("post_market: picks=%d filled=%d", len(picks_with_status), filled_count)
+    # v12.A.3: 写 VALIDATED fact (已开仓的逐个)
+    try:
+        from ..engine.temporal_facts import record
+        for p in picks_with_status:
+            if p.get("is_filled"):
+                record(
+                    subject=p.get("code", "?"),
+                    predicate="VALIDATED",
+                    object_=f"filled:{p.get('plan_used', '?')}",
+                    claim=f"盘后已开仓, 入场 {p.get('price', 0):.2f}",
+                    source="stage_post_market",
+                    pnl_pct=0.0,  # 真 PnL 等次日回填再写
+                )
+    except Exception as e:  # noqa: BLE001
+        log.warning("stage_post_market 写 VALIDATED fact 失败: %s", e)
     return {"ok": True, "filled_count": filled_count, "picks_count": len(picks_with_status)}
 
 
@@ -202,6 +233,25 @@ def stage_weekly_review() -> dict[str, Any]:
     result = push_weekly_report(weekly, bt, summary, save_pdf=True)
     log.info("[stage_weekly_review] saved=%s feishu_ok=%s",
              result.get("saved"), result.get("feishu", {}).get("ok"))
+    # v12.A.3: 把本周 SELECTED 标 superseded + 写一条周报 fact
+    try:
+        from datetime import date as _date
+        from ..engine.temporal_facts import record, query_active
+        week = _date.today().isoformat()
+        record(
+            subject="weekly",
+            predicate="TUNED",
+            object_=f"week:{week}",
+            claim=f"周报已生成, backtest days={days}",
+            source="stage_weekly_review",
+        )
+        # 标本周 active SELECTED 为 superseded (新一周已开启)
+        for f in query_active():
+            if f.get("predicate") == "SELECTED" and f.get("created_at", "").startswith(week[:7]):
+                from ..engine.temporal_facts import invalidate
+                invalidate(f["id"], reason=f"周报期 {week} 已过")
+    except Exception as e:  # noqa: BLE001
+        log.warning("stage_weekly_review 写 TUNED fact 失败: %s", e)
     return {"weekly": weekly, "backtest": bt, "summary": summary, "result": result}
 
 

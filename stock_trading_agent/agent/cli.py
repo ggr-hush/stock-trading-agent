@@ -77,6 +77,12 @@ def main() -> None:
     p_dedup.add_argument("action", choices=["stats", "reset"])
     p_memory.add_argument("action", choices=["list", "clear"])
     p_memory.add_argument("--chat-id", default="default")
+    # v12.A.3: tuner dry-run 屏障
+    p_weekly_review = sub.add_parser("weekly-review", help="v12.A.3: 调参 (默认 dry-run, --write 真改)")
+    p_weekly_review.add_argument("--write", action="store_true",
+                                  help="真写到 config.yaml + params_history (默认只看 preview)")
+    p_weekly_review.add_argument("--json", action="store_true",
+                                  help="输出 JSON (admin 卡片用)")
 
     args = parser.parse_args()
 
@@ -95,6 +101,31 @@ def main() -> None:
     if args.cmd == "dedup":
         from .dedup_cli import dispatch as _dedup_dispatch
         sys.exit(_dedup_dispatch(args.action))
+    if args.cmd == "weekly-review":
+        from ..engine.tuner import run_weekly_tune
+        from ..engine.paper_trader import init_account
+        init_account()
+        dry_run = not args.write
+        result = run_weekly_tune(dry_run=dry_run)
+        if args.json:
+            print(json.dumps({
+                "dry_run": dry_run,
+                "preview_count": len(result.get("preview", [])),
+                "applied_count": len(result.get("applied", [])),
+                "pending_count": len(result.get("pending", [])),
+                "preview": result.get("preview", []),
+                "applied": result.get("applied", []),
+                "pending": result.get("pending", []),
+                "stats": result.get("stats", {}),
+            }, ensure_ascii=False, indent=2, default=str))
+        else:
+            mode = "🔍 dry-run" if dry_run else "✍️ APPLY"
+            print(f"{mode} weekly-tune 完毕:")
+            print(f"  preview/applied: {len(result.get('preview' if dry_run else 'applied', []))}")
+            print(f"  pending (待用户确认): {len(result.get('pending', []))}")
+            for p in (result.get("preview", []) if dry_run else result.get("applied", [])):
+                print(f"    · {p.get('param', '?')}: {p.get('old', '?')} → {p.get('new', '?')}")
+        return
     if args.cmd == "daemon":
         from .stages import run_daemon
         _install_daemon_signals()

@@ -58,8 +58,11 @@ def detect_memory_signal(text: str) -> Optional[tuple[str, str, str]]:
     if not text or not text.strip():
         return None
     s = text.strip()
-    # 显式: "记住 XXX"
+    # v12.A.3: guardrail 识别 — "记住 [规则] XXX" / "记住 [卫语句] XXX"
     if _RE_EXPLICIT.search(s):
+        m_grd = re.search(r"\[\s*(规则|卫语句|guardrail)\s*\]\s*(.+)", s)
+        if m_grd:
+            return ("guardrail", m_grd.group(2).strip(), "explicit")
         return ("explicit", s, "explicit")
     # 偏好
     m = _RE_PREF_NEG.search(s)
@@ -192,29 +195,74 @@ def set_pref(chat_id: str, key: str, value: Any) -> None:
 
 
 def build_memory_context(chat_id: str, max_chars: int = 1200) -> str:
-    """拼成 system prompt 末尾的 "用户记忆" 段
+    """v12.A.3: 按 4 类 (preference / fact / decision / guardrail) 分组渲染, 每类 limit 2
 
     结构:
-      用户记忆 (90 天内):
-      - [preference] 不喜欢银行股
-      - [fact] 关注 600519
-      ...
+      用户记忆 (按类型分组):
+      
+      [偏好]
+      - 不喜欢银行股
+      [事实]
+      - 关注 600519
+      [决策]
+      - 刚买 002063
+      [卫语句]
+      - 不准用"显然/必然"推仓位
 
-    超出 max_chars 自动截断
+    Args:
+        chat_id: 飞书 chat_id
+        max_chars: 总字符上限 (默认 800, 包含分组头)
     """
     if not chat_id:
         return ""
     mems = list_memories(chat_id, limit=30)
     if not mems:
         return ""
-    lines = ["用户记忆 (近 90 天, 重要度从高到低):"]
-    total = len(lines[0])
+    # v12.A.3: 按 type 分组, 顺序固定 (偏好 → 事实 → 决策 → 卫语句 → 其它)
+    GROUP_ORDER = [
+        ("preference", "偏好"),
+        ("fact", "事实"),
+        ("decision", "决策"),
+        ("guardrail", "卫语句"),
+    ]
+    grouped: dict[str, list[dict[str, Any]]] = {k: [] for k, _ in GROUP_ORDER}
+    other: list[dict[str, Any]] = []
     for m in mems:
+        t = m.get("type", "")
+        if t in grouped:
+            grouped[t].append(m)
+        else:
+            other.append(m)
+    # 每类 importance DESC (list_memories 已排), 限 2 条
+    lines: list[str] = ["用户记忆 (按类型分组):"]
+    total = sum(len(x) for x in lines)
+    has_any = False
+    for key, label in GROUP_ORDER:
+        items = grouped[key][:2]
+        if not items:
+            continue
+        header = f"\n[{label}]"
+        if total + len(header) + 1 > max_chars:
+            break
+        lines.append(header)
+        total += len(header)
+        for m in items:
+            line = f"- {m.get('content', '')}"
+            if total + len(line) + 1 > max_chars:
+                break
+            lines.append(line)
+            total += len(line) + 1
+            has_any = True
+        if total >= max_chars:
+            break
+    # 其它 (interaction / explicit 等) 走扁平尾部
+    for m in other[:3]:
         line = f"- [{m.get('type', '?')}] {m.get('content', '')}"
         if total + len(line) + 1 > max_chars:
             break
         lines.append(line)
         total += len(line) + 1
-    if len(lines) == 1:
+        has_any = True
+    if not has_any:
         return ""
     return "\n".join(lines)

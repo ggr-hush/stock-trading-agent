@@ -21,6 +21,14 @@ from .data_fetcher import load_config, is_trading_day, get_market_env
 from .paper_trader import get_db
 from .reviewer import backtest_multi
 from . import knowledge
+from .evidence import (
+    build_evidence_from_rag,
+    build_evidence_from_sql,
+    build_evidence_from_live,
+    build_evidence_from_facts,
+    format_evidence_for_prompt,
+    render_evidence_section,
+)
 
 log = logging.getLogger("engine.skills")
 
@@ -74,6 +82,14 @@ def _run_get_picks(args: dict[str, Any]) -> dict[str, Any]:
         "count": len(rows),
         "items": [dict(r) for r in rows],
     }
+    # v12.A.3: evidence 字段 (rows 是 sqlite3.Row, 没 .get(), 用 dict 包装)
+    if rows:
+        first = dict(rows[0])
+        result["evidence"] = build_evidence_from_sql(
+            f"picks 表 ({target_date or '最近'})",
+            len(rows),
+            sample=f"{first.get('code', '')} {first.get('name', '')} 评分 {first.get('score', 0):.1f}",
+        )
     # v12.A.2: picks 空时查 stage 状态
     if not rows:
         try:
@@ -100,9 +116,10 @@ def _render_picks_card(result: dict[str, Any]) -> dict[str, Any]:
         # v12.A.2: picks 空时用 empty_reason 告诉用户为啥没 (治 '答非所问')
         reason = result.get("empty_reason", "无选股记录")
         return {"msg_type": "text", "content": {"text": f"📭 {reason}"}}
-    # v12.9.1: 改用 interactive card
+    # v12.9.1: 改用 interactive card (v12.A.3 +evidence 段)
     from .cards import card_picks
-    card = card_picks(items, date=result.get("date", ""))
+    card = card_picks(items, date=result.get("date", ""),
+                       evidence=result.get("evidence"))
     return {"msg_type": "interactive", "content": card}
 
 
@@ -120,16 +137,24 @@ def _run_get_positions(args: dict[str, Any]) -> dict[str, Any]:
             "FROM paper_positions WHERE status = ? ORDER BY pick_date DESC LIMIT 50",
             (status,),
         ).fetchall()
-    return {"status": status, "count": len(rows), "items": [dict(r) for r in rows]}
+    result = {"status": status, "count": len(rows), "items": [dict(r) for r in rows]}
+    if rows:
+        first = dict(rows[0])
+        result["evidence"] = build_evidence_from_sql(
+            f"paper_positions 表 (status={status})",
+            len(rows),
+            sample=f"{first.get('code', '')} {first.get('name', '')}",
+        )
+    return result
 
 
 def _render_positions_card(result: dict[str, Any]) -> dict[str, Any]:
     items = result.get("items", [])
     if not items:
         return {"msg_type": "text", "content": {"text": f"(无 {result.get('status', '')} 持仓)"}}
-    # v12.9.1: 改用 interactive card
+    # v12.9.1: 改用 interactive card (v12.A.3 +evidence 段)
     from .cards import card_positions
-    card = card_positions(items)
+    card = card_positions(items, evidence=result.get("evidence"))
     return {"msg_type": "interactive", "content": card}
 
 
@@ -251,6 +276,10 @@ def _run_get_market_env(args: dict[str, Any]) -> dict[str, Any]:
             "env_level": row["market_env_level"],
             "date": row["pick_date"],
             "source": "picks",
+            "evidence": build_evidence_from_sql(
+                f"picks 表 ({row['pick_date']})", 1,
+                sample=f"env_score={row['market_env_score']} level={row['market_env_level']}",
+            ),
         }
 
     # 5) 过去交易日 + picks 无 → 明确说'历史数据暂无', 不瞎编截止日
@@ -260,18 +289,25 @@ def _run_get_market_env(args: dict[str, Any]) -> dict[str, Any]:
             "env_level": "历史数据暂无 (picks 表当日为空)",
             "date": target_date.isoformat(),
             "source": "no_history",
+            "evidence": build_evidence_from_sql(
+                f"picks 表 ({target_date}, 空)", 0, sample="该日无选股/无 env 记录",
+            ),
         }
 
     # 6) date=today + picks 空 → 实时拉 (v12.5.1 老逻辑, 保持不变)
     try:
         from .data_fetcher import get_market_env as _fetch_env, load_config as _load_cfg
         cfg = _load_cfg()
-        env = _fetch_env(cfg)
+        env = _fetch_env(cfg)  # v12.A.3: 我之前改 evidence 误删了, 补回
         return {
             "env_score": env.get("env_score"),
             "env_level": env.get("env_level"),
             "date": today.isoformat(),
             "source": "realtime",
+            "evidence": build_evidence_from_sql(
+                "东方财富 push2 实时大盘", 1,
+                sample=f"env_score={env.get('env_score')} level={env.get('env_level')}",
+            ),
         }
     except Exception as e:  # noqa: BLE001
         log.warning("get_market_env 实时拉失败 (兜底): %s", e)
@@ -280,6 +316,7 @@ def _run_get_market_env(args: dict[str, Any]) -> dict[str, Any]:
             "env_level": "数据源不可用",
             "date": today.isoformat(),
             "source": "failed",
+            "evidence": [],
         }
 
 
@@ -303,6 +340,15 @@ def _render_market_env_card(result: dict[str, Any]) -> dict[str, Any]:
         f"  env_score: {score_str}\n"
         f"  env_level: {level}"
     )
+    # v12.A.3: 末尾加 evidence 段
+    evidence = result.get("evidence") or []
+    if evidence:
+        ev_lines = ["", "**📚 证据:**"]
+        for ev in evidence[:3]:
+            eid = ev.get("id", "?")
+            title = (ev.get("title") or "").strip()[:40]
+            ev_lines.append(f"- `[{eid}]` {title}" if title else f"- `[{eid}]`")
+        text += "\n" + "\n".join(ev_lines)
     return {"msg_type": "text", "content": {"text": text}}
 
 
@@ -354,6 +400,11 @@ def _run_get_stock_quote(args: dict[str, Any]) -> dict[str, Any]:
     if fetched_date and fetched_date != target_date.isoformat():
         kline["date"] = fetched_date  # 用接口实际返的 (最近交易日)
         kline["requested_date"] = target_date.isoformat()
+    # v12.A.3: evidence 字段
+    kline["evidence"] = build_evidence_from_sql(
+        f"东方财富 push2his.kline ({fetched_date or target_date})", 1,
+        sample=f"{kline.get('name', code)} 收盘 {kline.get('close')} 涨跌 {kline.get('chg_pct')}%",
+    )
     return kline
 
 
@@ -397,6 +448,15 @@ def _render_stock_quote_card(result: dict[str, Any]) -> dict[str, Any]:
         f"  \u6210\u4ea4\u989d: {amount_yi}\u4ebf\n"
         f"  \u6362\u624b: {turnover}%"
     )
+    # v12.A.3: 末尾加 evidence 段
+    evidence = result.get("evidence") or []
+    if evidence:
+        ev_lines = ["", "**📚 证据:**"]
+        for ev in evidence[:3]:
+            eid = ev.get("id", "?")
+            title = (ev.get("title") or "").strip()[:40]
+            ev_lines.append(f"- `[{eid}]` {title}" if title else f"- `[{eid}]`")
+        text += "\n" + "\n".join(ev_lines)
     return {"msg_type": "text", "content": {"text": text}}
 
 
@@ -555,25 +615,33 @@ def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
             f"换手 {realtime.get('turnover')}%]"
         )
         explanation = explanation.rstrip() + rt_line
+    # v12.A.3: evidence 字段 (RAG + 实时一起, 用于卡片底部)
+    evidence: list[dict[str, Any]] = []
+    evidence.extend(build_evidence_from_rag(rag_results, max_items=3))
+    if realtime:
+        evidence.extend(build_evidence_from_live(
+            realtime.get("name") or code,
+            realtime.get("price"),
+            realtime.get("chg_pct"),
+        ))
     return {"code": code, "name": pick.get("name"),
             "explanation": explanation or "（LLM 暂不可用）",
             "rag_sources": rag_sources,
-            "realtime": realtime}
-    return {"code": code, "name": pick.get("name"),
-            "explanation": explanation or "（LLM 暂不可用）",
-            "rag_sources": rag_titles}
+            "realtime": realtime,
+            "evidence": evidence}
 
 
 def _render_explain_card(result: dict[str, Any]) -> dict[str, Any]:
     explanation = _strip_think(result.get("explanation", ""))
     sources = result.get("rag_sources") or result.get("sources") or []
-    # v12.9.1: 改用 interactive card
+    # v12.9.1: 改用 interactive card (v12.A.3 evidence 段)
     from .cards import card_explain
     card = card_explain(
         code=result.get("code", "?"),
         name=result.get("name", ""),
         explanation=explanation,
         sources=sources,
+        evidence=result.get("evidence"),
     )
     return {"msg_type": "interactive", "content": card}
 
@@ -583,11 +651,13 @@ def _run_search_knowledge(args: dict[str, Any]) -> dict[str, Any]:
     query: str = args.get("query", "").strip()
     k: int = int(args.get("k", 3))
     if not query:
-        return {"query": query, "answer": "（请提供问题）", "sources": []}
+        return {"query": query, "answer": "（请提供问题）", "sources": [], "evidence": []}
     results = knowledge.retrieve(query, k=k)
     sources = [{"title": r.get("title", "?"), "score": r.get("score", 0)} for r in results]
     answer = with_knowledge(query, k=k) if results else "（知识库无相关结果）"
-    return {"query": query, "answer": answer or "（LLM 暂不可用）", "sources": sources}
+    # v12.A.3: evidence 字段
+    evidence = build_evidence_from_rag(results, max_items=3)
+    return {"query": query, "answer": answer or "（LLM 暂不可用）", "sources": sources, "evidence": evidence}
 
 
 def _render_search_knowledge_card(result: dict[str, Any]) -> dict[str, Any]:
@@ -612,6 +682,54 @@ def _run_backtest(args: dict[str, Any]) -> dict[str, Any]:
         "metrics": result.get("metrics", {}),
         "by_plan": result.get("by_plan", {}),
     }
+
+
+
+
+def _run_get_stock_lifecycle(args: dict[str, Any]) -> dict[str, Any]:
+    """v12.A.3: 查某只票的 temporal facts 时间线
+
+    Args:
+        code: 股票代码 (e.g. "002063")
+        include_invalidated: 是否含 superseded/invalidated (默认 False 只 active)
+    """
+    from .temporal_facts import query_active, query_all
+    code: str = (args or {}).get("code", "").strip()
+    include_invalidated: bool = bool((args or {}).get("include_invalidated", False))
+    if not code:
+        return {"code": code, "events": [], "error": "（请提供股票代码）"}
+    if include_invalidated:
+        events = query_all(subject=code, include_invalidated=True)
+    else:
+        events = query_active(subject=code)
+    # 按时间倒序
+    events.sort(key=lambda x: x.get("created_at", ""), reverse=True)
+    return {
+        "code": code,
+        "events": events,
+        "count": len(events),
+        "include_invalidated": include_invalidated,
+    }
+
+
+def _render_stock_lifecycle_card(result: dict[str, Any]) -> dict[str, Any]:
+    code = result.get("code", "?")
+    events = result.get("events", [])
+    if not events:
+        return {"msg_type": "text", "content": {"text": f"📅 {code} 暂无时序记录"}}
+    lines = [f"📅 **{code} 时序账本** ({result.get('count', 0)} 条)"]
+    for e in events[:10]:
+        status_icon = {"active": "🟢", "superseded": "🟡", "invalidated": "🔴"}.get(
+            e.get("status", "?"), "⚪")
+        pred = e.get("predicate", "?")
+        claim = (e.get("claim") or "")[:50]
+        date = (e.get("created_at", "")[:10]) or "?"
+        lines.append(f"{status_icon} `{date}` **{pred}** {claim}")
+    if len(events) > 10:
+        lines.append(f"_(还有 {len(events) - 10} 条未显示)_")
+    return {"msg_type": "interactive", "content": {
+        "tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}
+    }}
 
 
 def _render_backtest_card(result: dict[str, Any]) -> dict[str, Any]:
@@ -830,6 +948,31 @@ SKILL_REGISTRY: dict[str, Skill] = {
         run=_run_backtest,
         render_to_card=_render_backtest_card,
     ),
+    "get_stock_lifecycle": Skill(
+        name="get_stock_lifecycle",
+        description="查某只票的时序账本 (选股/复盘/作废) 时间线。",
+        uses_llm=False,
+        schema={
+            "type": "function",
+            "function": {
+                "name": "get_stock_lifecycle",
+                "description": "查个股时序事实 (active / 含 invalidated)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "code": {"type": "string", "description": "6 位股票代码"},
+                        "include_invalidated": {
+                            "type": "boolean",
+                            "description": "是否含 superseded/invalidated (默认 false 只 active)",
+                        },
+                    },
+                    "required": ["code"],
+                },
+            },
+        },
+        run=_run_get_stock_lifecycle,
+        render_to_card=_render_stock_lifecycle_card,
+    ),
 }
 
 
@@ -846,6 +989,8 @@ _KEYWORD_FALLBACK: list[tuple[list[str], str]] = [
     (["大盘", "市场环境", "env", "市场怎么样", "大盘怎么样", "行情", "市场行情", "盘面"], "get_market_env"),
     (["阶段", "跑了", "stage_runs", "今天跑了什么"], "get_stage_runs"),
     (["回测", "backtest", "复盘"], "backtest"),
+    # v12.A.3: 时序账本
+    (["时序", "生命周期", "lifecycle", "历史决策", "这票历史"], "get_stock_lifecycle"),
 ]
 
 

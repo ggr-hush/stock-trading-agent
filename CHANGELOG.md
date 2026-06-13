@@ -2,6 +2,92 @@
 
 本项目所有重要变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v12.A.3] - 2026-06-13
+
+借鉴 `docs/借鉴分析-trading-review-wiki.md` 4 个可借鉴点, 一包发 v12.A.3。**不学** #5 桌面 app / 自动更新。
+
+### 借鉴 #1: 证据编号 (折中方案)
+**目标**: LLM 答案"逐条引用"而不是自由发挥, 用户能看清每个判断来自哪。
+- **新文件** `engine/evidence.py` (~130 行): `make_evidence_id` / `format_evidence_for_prompt` / `render_evidence_section` / 4 个 builder (RAG/SQL/live/facts)
+  - 编号约定: R (RAG) / S (SQL) / L (Live) / F (Facts) / M (Memory) / K (Kline)
+- **`engine/skills.py`**: 5 个 `_run_*` 都加 `evidence: [{id, kind, title, snippet}]` 字段
+  - `_run_explain_pick`: RAG + live 合并
+  - `_run_search_knowledge`: RAG
+  - `_run_get_picks` / `_run_get_positions`: SQL (`first = dict(rows[0])` 防 sqlite3.Row 无 .get())
+  - `_run_get_market_env`: 4 分支 (picks/realtime/no_history/failed) 各带 evidence
+  - `_run_get_stock_quote`: K 线源
+- **`engine/cards.py`**: `card_picks` / `card_positions` / `card_explain` 加 evidence 参数 → 卡片底部插入 "📚 证据" 段
+- **修 `_run_get_market_env` BUG**: v12.A.3 evidence 改造时误删了 5 分支的 `if target_date < today:` 条件, 导致 past + picks 空 会走到 6 分支 realtime。已补回。
+- **3 个 j2 模板** (`advisor.j2` / `with_knowledge.j2` / `auto_period_explain.j2`) 末尾加引用编号要求
+- **测试** `tests/test_v12_a_3_evidence.py` (11 个): 工具函数 3 + skill 字段 5 + 卡片底部 2 + j2 smoke 1
+
+### 借鉴 #2: memory 4 类分组注入
+**目标**: `build_memory_context` 按 type 分组, 每类 limit 2, 总 ≤ 800 字。
+- **`assistant/memory.py:build_memory_context`** 重构成 4 类分组渲染: 偏好 → 事实 → 决策 → 卫语句 → 其它
+  - 顺序固定, importance DESC + created_at DESC 兜底
+  - 渲染格式:
+    ```
+    用户记忆 (按类型分组):
+    [偏好]
+    - 不喜欢银行股
+    [事实]
+    - 关注 600519
+    ```
+- **`detect_memory_signal`** 加 guardrail 识别: `"记住 [规则] XXX"` / `"记住 [卫语句] XXX"` → type=guardrail
+- **测试** `tests/test_v12_a_3_memory.py` (5 个): 4 类分组各 1 + 空 memory 1 + guardrail 1
+
+### 借鉴 #3: temporal facts 时序账本
+**目标**: 选股/复盘/调参走 append-only JSONL, sha1 幂等, active/invalidated 状态机。
+- **新文件** `engine/temporal_facts.py` (~210 行): `record` / `supersede` / `invalidate` / `query_active` / `query_all` / `get_fact`
+  - 存储: `data/facts/stock_events.jsonl` (gitignore)
+  - fact_id = sha1(subject|predicate|object)[:12] 幂等
+  - PREDICATE_VOCAB v1: SELECTED / VALIDATED / SUPERSEDED / INVALIDATED / TUNED
+- **`agent/stages.py`**: 3 个写点
+  - `stage_pick`: 给每只候选写 SELECTED (subject=code, object=plan:?)
+  - `stage_post_market`: 给已开仓的写 VALIDATED
+  - `stage_weekly_review`: 写 TUNED, 并标本周 SELECTED 为 invalidated
+- **新 skill** `get_stock_lifecycle` (engine/skills.py): 查某只票的 active facts 时间线, `include_invalidated=true` 看完整历史
+- **关键词降级**: 时序/生命周期/lifecycle → `get_stock_lifecycle`
+- **测试** `tests/test_v12_a_3_temporal.py` (7 个) + `tests/test_v12_a_3_stages.py` (3 个)
+
+### 借鉴 #4: tuner apply --write 屏障
+**目标**: 调参默认 dry-run, --write 才真改 config.yaml + params_history。
+- **`engine/tuner.py:run_weekly_tune(dry_run=True)`**: 默认只算 proposals 不写库, 返 `preview` 列表让 admin 卡片展示
+  - dry_run=True → preview 不写; dry_run=False → applied 真写
+- **`agent/cli.py`**: 新增 `agent weekly-review` subcommand
+  - `--write` flag (默认不看, 干跑预览)
+  - `--json` 输出结构化 JSON (admin 卡片用)
+  - 人类格式输出 preview/applied/pending 数量
+- **测试** `tests/test_v12_a_3_tuner.py` (3 个): dry-run 不写 / --write 真调 / metrics 一致
+
+### 改动文件
+- **新增**: `engine/evidence.py` / `engine/temporal_facts.py` / 5 个 test 套件
+- **改**: `engine/skills.py` (5 个 _run + 5 个 _render + new skill + keyword) / `engine/cards.py` (3 card 接受 evidence) / `assistant/memory.py` (4 类分组 + guardrail) / `agent/stages.py` (3 个写点) / `agent/cli.py` (weekly-review subcommand) / `engine/tuner.py` (dry_run 参数) / 3 个 j2 模板
+- **改**: `.gitignore` (加 `data/facts/*.jsonl`)
+
+### Migration
+- 老库 `quant.db` 不需改 (memories.type 已有 5 候选, 4 类分组渲染向后兼容)
+- `data/facts/` 目录运行时创建 (gitignore 加了 `data/facts/*.jsonl`)
+- **tuner 行为变更**: 默认 dry-run, 真跑要 `agent weekly-review --write` (Mac launchd 不动, 不会自动改)
+- **stage_runs 表**: 装饰器 `_with_stage_run_logging` 自动记账, 不动
+
+### Test
+- **v12.A.3 新增 29 测试全绿**: evidence 11 / memory 5 / temporal 7 / stages 3 / tuner 3
+- **v12.A.2 旧 27 测试** 26/27 (1 pre-existing: stage_runs 表累积导致 picks-empty 测试与现实状态不一致, 数据问题非代码 regression)
+- **老 test_tuner.py 1 pre-existing fail** (plan 已标注)
+- **目标 264 测试 / 14 套件, 实际 263/265 通过**
+
+### 假设 / 默认
+- **temporal_facts 存 JSONL 不入 SQLite**: 跟 trading-review-wiki 一致, append-only + sha1 幂等, 简单且够用
+- **fact predicate 用 v1 默认词表**: SELECTED / VALIDATED / SUPERSEDED / INVALIDATED / TUNED
+- **guardrail 复用 memory.explicit**: "记住 [规则] XXX" 写 type=guardrail, 不引入新表
+- **stage 默认真写不阻塞**: 跟用户确认, launchd 不动
+- **tuner dry-run 默认开启**: 跟用户确认, 用户手动管
+- **不引入 LangChain / LlamaIndex / 外部依赖**: JSONL / sha1 / sqlite 全部 stdlib + 已有
+- **不学 #5 桌面 app / 自动更新**: 用户已确认
+
+---
+
 ## [v12.A.2] - 2026-06-13
 
 ### Fixed (体验优化包: 5 改 1 包 + 1 顺手)

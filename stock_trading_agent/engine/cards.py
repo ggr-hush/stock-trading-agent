@@ -54,10 +54,12 @@ def _bar(pct: float, width: int = 10) -> str:
     return "🟥" + "▇" * n
 
 
-def card_picks(picks: list[dict[str, Any]], date: str = "") -> dict[str, Any]:
-    """v12.9.1: 今日选股 interactive card
+def card_picks(picks: list[dict[str, Any]], date: str = "",
+               evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """v12.9.1: 今日选股 interactive card (v12.A.3 加 evidence 段)
 
     输入 picks 字段: code / name / sector / score / chg_pct / price / plan
+    evidence: 卡片底部 "📚 证据" 段
     """
     title = f"今日选股 · {date}" if date else "今日选股"
     if not picks:
@@ -82,6 +84,11 @@ def card_picks(picks: list[dict[str, Any]], date: str = "") -> dict[str, Any]:
             elements.append({"tag": "hr"})
     if len(picks) > 10:
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": f"_(还有 {len(picks)-10} 只未显示)_"}})
+    # v12.A.3: 底部加证据段
+    if evidence:
+        from .evidence import render_evidence_section
+        elements.append({"tag": "hr"})
+        elements.append(render_evidence_section(evidence))
     return _card(title, elements)
 
 
@@ -96,10 +103,12 @@ def _position_holding_days(pick_date: str) -> int:
         return 0
 
 
-def card_positions(positions: list[dict[str, Any]]) -> dict[str, Any]:
-    """v12.A.2: 持仓 interactive card + 盈亏柱 + 板块分布 + 持仓天数
+def card_positions(positions: list[dict[str, Any]],
+                  evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """v12.A.2: 持仓 interactive card + 盈亏柱 + 板块分布 + 持仓天数 (v12.A.3 +evidence)
 
     增强: 每只票加持仓天数 + 盈亏柱; 末尾加板块分布汇总
+    evidence: 卡片底部 "📚 证据" 段
     """
     if not positions:
         return _card("持仓", [
@@ -156,12 +165,18 @@ def card_positions(positions: list[dict[str, Any]]) -> dict[str, Any]:
                 f"  · {sec}: {st['count']} 只, 平均 {mark} {avg:+.1f}%"
             )
         elements.append({"tag": "div", "text": {"tag": "lark_md", "content": "\n".join(sector_lines)}})
+    # v12.A.3: 底部加证据段
+    if evidence:
+        from .evidence import render_evidence_section
+        elements.append({"tag": "hr"})
+        elements.append(render_evidence_section(evidence))
     return _card("持仓", elements)
 
 
 def card_explain(code: str, name: str, explanation: str,
-                 sources: list[str] | None = None) -> dict[str, Any]:
-    """v12.9.1: 解释类卡 — 标题 / 主体 / 来源"""
+                 sources: list[str] | None = None,
+                 evidence: list[dict[str, Any]] | None = None) -> dict[str, Any]:
+    """v12.9.1: 解释类卡 — 标题 / 主体 / 来源 (v12.A.3 +evidence 段)"""
     elements: list[dict] = [
         {"tag": "div", "text": {"tag": "lark_md", "content": explanation}},
     ]
@@ -171,7 +186,11 @@ def card_explain(code: str, name: str, explanation: str,
             "tag": "div",
             "text": {"tag": "lark_md", "content": "**来源**: " + " / ".join(sources[:3])},
         })
-    template = "blue" if sources else "grey"
+    if evidence:
+        elements.append({"tag": "hr"})
+        from .evidence import render_evidence_section
+        elements.append(render_evidence_section(evidence))
+    template = "blue" if (sources or evidence) else "grey"
     return _card(f"💡 {code} {name}", elements, template=template)
 
 

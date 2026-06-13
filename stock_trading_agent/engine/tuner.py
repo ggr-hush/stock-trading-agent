@@ -293,12 +293,15 @@ def apply_proposal(proposal: dict[str, Any], auto: bool) -> bool:
     return True
 
 
-def run_weekly_tune() -> dict[str, Any]:
-    """周日 20:00 跑一次
+def run_weekly_tune(dry_run: bool = True) -> dict[str, Any]:
+    """v12.A.3: dry_run=True 默认只算 proposals 不写库 (--write 才真改)
 
     Returns:
         {
-          stats, applied: [...], pending: [...]  # pending = 需要飞书确认
+          stats, preview: [...], applied: [...], pending: [...]
+          preview = dry_run 模式下计算出的将应用的 proposals (未真写)
+          applied = 真写到 config.yaml + params_history 的 proposals
+          pending = 需用户确认的 (out-of-safe-range 或 judge 不通过)
         }
     """
     cfg = load_config()
@@ -312,6 +315,7 @@ def run_weekly_tune() -> dict[str, Any]:
 
     applied: list[dict[str, Any]] = []
     pending: list[dict[str, Any]] = []
+    preview: list[dict[str, Any]] = []
     # v9.4: LLM-as-judge 开关
     judge_cfg = cfg.get("tuner", {})
     judge_enabled = judge_cfg.get("judge_enabled", False)
@@ -331,8 +335,12 @@ def run_weekly_tune() -> dict[str, Any]:
                 except Exception as e:  # noqa: BLE001
                     # judge 调用失败, 走默认通过
                     p["judgment"] = {"error": str(e)}
-            apply_proposal(p, auto=True)
-            applied.append(p)
+            # v12.A.3: dry_run 屏障
+            if dry_run:
+                preview.append(p)
+            else:
+                apply_proposal(p, auto=True)
+                applied.append(p)
         else:
             pending.append(p)
-    return {"stats": stats, "applied": applied, "pending": pending}
+    return {"stats": stats, "preview": preview, "applied": applied, "pending": pending}

@@ -10,6 +10,9 @@ data/quant.db
 data/quant.db-journal
 data/picks_legacy/**
 !data/picks_legacy/.gitkeep
+# v12.A.3: 时序账本 (append-only JSONL, 本地缓存不上传)
+data/facts/*.jsonl
+!data/facts/.gitkeep
 
 # Local env
 .env
