@@ -10,7 +10,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
-from .data_fetcher import curl_get
+from .tushare_client import get_pro, to_ts_code, rate_limit_sleep
 from .paper_trader import get_db
 
 
@@ -27,45 +27,54 @@ def get_open_positions_for_monitor() -> list[dict[str, Any]]:
 
 
 def fetch_realtime_quotes(codes: list[str]) -> dict[str, dict[str, Any]]:
-    """从 qt.gtimg.cn 拉实时行情, 返回 {code: {price, prev_close, chg_pct, amplitude}}"""
+    """v12.A.4.c: Tushare daily + daily_basic 拉实时行情
+
+    返回 {code: {price, prev_close, chg_pct, amplitude}}
+    失败 / 拉不到 → 该 code 不在结果里 (让上层当成"无行情"处理)
+
+    实现:
+      1) 查最近 1 个交易日的 daily, 拿 close / pre_close / pct_chg
+      2) 同一日 daily_basic 拿 amplitude (Tushare daily 也有 amplitude 字段)
+      3) 单只票查询 (持仓不会太多, 不走全市场)
+    """
     if not codes:
         return {}
-    # qt.gtimg.cn 用 sh+code / sz+code 前缀
-    prefixed = []
-    for c in codes:
-        if c.startswith("6"):
-            prefixed.append(f"sh{c}")
-        elif c.startswith(("0", "3")):
-            prefixed.append(f"sz{c}")
-        else:
-            prefixed.append(c)  # 兼容
-    joined = ",".join(prefixed)
-    raw = curl_get(f"https://qt.gtimg.cn/q={joined}")
+    from datetime import date as _d, timedelta
+    pro = get_pro()
+    today = _d.today()
+    # 找最近 1 个交易日 (T+1 兼容)
+    end_d = today.strftime("%Y%m%d")
+    beg_d = (today - timedelta(days=10)).strftime("%Y%m%d")
     out: dict[str, dict[str, Any]] = {}
-    for line in raw.strip().splitlines():
-        m = re.search(r'v_(\w+)="([^"]+)"', line)
-        if not m:
-            continue
-        full = m.group(1)
-        code = full[2:] if len(full) > 2 else full  # 去 sh/sz 前缀
-        parts = m.group(2).split("~")
-        if len(parts) < 10:
+    for code in codes:
+        ts_code = to_ts_code(code)
+        if "." not in ts_code:
             continue
         try:
-            price = float(parts[3]) if parts[3] else 0.0
-            prev_close = float(parts[4]) if parts[4] else 0.0
-            chg_pct = float(parts[32]) if len(parts) > 32 and parts[32] else 0.0
-            amplitude = float(parts[37]) if len(parts) > 37 and parts[37] else 0.0
-        except (ValueError, IndexError):
+            df = pro.daily(ts_code=ts_code, start_date=beg_d, end_date=end_d,
+                           fields="ts_code,trade_date,close,pre_close,pct_chg,high,low")
+            if df is None or df.empty:
+                continue
+            row = df.sort_values("trade_date", ascending=False).iloc[0]
+            close = float(row.get("close") or 0)
+            pre_close = float(row.get("pre_close") or 0)
+            pct_chg = float(row.get("pct_chg") or 0)
+            high = float(row.get("high") or 0)
+            low = float(row.get("low") or 0)
+            # 振幅 = (high - low) / pre_close * 100
+            amplitude = round((high - low) / pre_close * 100, 2) if pre_close > 0 else 0.0
+            if close <= 0 or pre_close <= 0:
+                continue
+            out[code] = {
+                "price": close,
+                "prev_close": pre_close,
+                "chg_pct": pct_chg,
+                "amplitude": amplitude,
+            }
+            rate_limit_sleep(0.05)
+        except Exception as e:
+            print(f"[intraday] {code} 拉取失败: {e}", file=__import__("sys").stderr)
             continue
-        if price <= 0 or prev_close <= 0:
-            continue
-        out[code] = {
-            "price": price,
-            "prev_close": prev_close,
-            "chg_pct": chg_pct,
-            "amplitude": amplitude,
-        }
     return out
 
 

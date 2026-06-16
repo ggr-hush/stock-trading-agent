@@ -21,6 +21,24 @@ from typing import Any
 log = logging.getLogger("agent.cli")
 
 
+def _handle_review_cmd(args) -> None:
+    """v12.A.4: 处理 `agent review list` 子命令 (轻量)"""
+    from ..engine.reviews import query_reviews
+    from ..engine.paper_trader import init_account
+    init_account()
+    if args.action == "list":
+        items = query_reviews(limit=50)
+        if not items:
+            print("  (无复盘)")
+        else:
+            print(f"  复盘共 {len(items)} 条:")
+            for r in items:
+                action = "✅" if r.get("action_taken") else "👀"
+                print(f"    {action} [{r.get('date', '?')}] {r.get('stock_code', '?')} "
+                      f"{r.get('result', '')} "
+                      f"tags={r.get('tags', [])}  ({(r.get('summary', '') or '')[:40]})")
+
+
 def _handle_memory_cmd(args) -> None:
     """处理 `agent memory list/clear --chat-id X` 子命令"""
     from ..assistant.memory import list_memories as _list_mem, clear_memories as _clear_mem
@@ -78,6 +96,8 @@ def main() -> None:
     p_memory.add_argument("action", choices=["list", "clear"])
     p_memory.add_argument("--chat-id", default="default")
     # v12.A.3: tuner dry-run 屏障
+    p_review = sub.add_parser("review", help="v12.A.4: 复盘管理 (list)")
+    p_review.add_argument("action", choices=["list"])
     p_weekly_review = sub.add_parser("weekly-review", help="v12.A.3: 调参 (默认 dry-run, --write 真改)")
     p_weekly_review.add_argument("--write", action="store_true",
                                   help="真写到 config.yaml + params_history (默认只看 preview)")
@@ -97,6 +117,9 @@ def main() -> None:
         return
     if args.cmd == "memory":
         _handle_memory_cmd(args)
+        return
+    if args.cmd == "review":
+        _handle_review_cmd(args)
         return
     if args.cmd == "dedup":
         from .dedup_cli import dispatch as _dedup_dispatch

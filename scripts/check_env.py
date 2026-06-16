@@ -27,6 +27,8 @@ KEY_META = [
     ("FEISHU_CHAT_ID",           "飞书群 chat_id",         "PUSH_MODE=app/auto 时必填 (消息发到哪个群)"),
     ("FEISHU_PUSH_MODE",         "推送通道模式",          "app / webhook / auto, 默认 auto"),
     ("BOT_ENCRYPTION_KEY",       "Session Fernet 加密",    "可选 (留空=明文 session)"),
+    ("TUSHARE_TOKEN",            "Tushare 代理 token",      "v12.A.4.c 起必填 (大盘/K线/板块/交易日历)"),
+    ("TUSHARE_PROXY_URL",        "Tushare 代理地址",        "v12.A.4.c 必填 (从 .env 读, 不硬编码)"),
 ]
 
 

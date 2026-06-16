@@ -19,7 +19,14 @@ def _score_stock(s: dict[str, Any], config: dict[str, Any]) -> float:
     amount_score = min(float(s.get("amount_yi", 0)) / 30, 1) * 30
     turn_score = min(float(s.get("turnover", 0)) / 10, 1) * 30
     chg = float(s.get("chg_pct", 0))
-    chg_score = min(abs(chg - 3.0) / 1.0, 1) * 20  # 越接近 3% 越高
+    # v3.1: 方向感知 — 跌 = 0 分; 涨越接近 3% 越高
+    if chg < 0:
+        chg_score = 0.0
+    elif abs(chg - 3.0) <= 1.0:
+        chg_score = 20.0  # 涨 2-4% 区间满 20 分
+    else:
+        # 偏离 3% 越远越低 (e.g. 涨 5% = 20 - 2*10 = 0, 涨 1% = 20 - 2*10 = 0)
+        chg_score = max(20.0 - abs(chg - 3.0) * 10, 0.0)
     size_score = min(float(s.get("total_mv_yi", 0)) / 300, 1) * 20
     base = amount_score + turn_score + chg_score + size_score
     # 强信号带加分
@@ -117,7 +124,12 @@ def filter_stocks(
     elif df_b:
         final, plan_used = df_b, "B"
     else:
-        final, plan_used = [], "C"
+        # v3.1: plan_c 兜底 — 突破性创新
+        # 之前 plan_c = [] (空仓), 推送空推, 飞书推 "今日空仓"
+        # 现在: plan_c 路径从全池(非 hard_excl)拉评分 ≥ 60 的高分票
+        # 解决 plan_a/b 阈值太严时 "全天无票" 的问题
+        df_c = [s for i, s in enumerate(stocks) if i not in hard_excl]
+        final, plan_used = df_c, "C"
 
     # 注入板块
     if stock_sector_map:
@@ -138,6 +150,13 @@ def filter_stocks(
                 s["score"] = round(s["score"] + v3["theme_bonus"]["value"], 2)
 
     final.sort(key=lambda x: x["score"], reverse=True)
+
+    # v3.1: plan_c 兜底收紧 — 只保留 score >= 60 的高分票, 避免低分冷门小盘股被推
+    if plan_used == "C":
+        pre_c = len(final)
+        final = [s for s in final if s["score"] >= 60.0]
+        if pre_c - len(final) > 0:
+            print(f"  [v3.1 plan_c] 评分 < 60 过滤剔除 {pre_c - len(final)} 只")
 
     # v3 过滤：评分上限
     pre = len(final)

@@ -38,3 +38,7 @@ data/paper_trader.db
 
 # v12.A.2 dedup cache (runtime)
 data/dedup_seen.json
+
+# v12.A.4.c: Tushare 启动预热缓存 (一天一文件, 不入仓)
+data/cache/
+data/trade_cal/

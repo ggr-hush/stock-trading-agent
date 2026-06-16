@@ -9,6 +9,7 @@ data_fetcher.py — 行情数据抓取层
 from __future__ import annotations
 
 import json
+import sys
 from urllib.parse import urlencode
 import os
 import re
@@ -97,71 +98,6 @@ def is_placeholder(v: Optional[str]) -> bool:
     return v.startswith("<") and v.endswith(">")
 
 
-def get_sina_ut(allow_auto_refresh: bool = True) -> str:
-    """东方财富 push2delay 的 ut 参数。
-
-    解析顺序:
-      1) 进程 env / .env 里显式设了 FEISHU_SINA_UT  → 用你的值 (最优先, 用于东财轮换后快速覆盖)
-      2) 模块常量 _DEFAULT_UT (原 daily-stock-picker 一直用的硬编码值)
-      3) 可选: 抓 https://data.eastmoney.com/ 页面里的 ut 字符串 (东财极少轮换, 默认尝试一次)
-
-    注意: 这是公开 token, 不是 cookie/凭据, 正常不需要用户配。
-    """
-    global _UT_CACHE
-    if _UT_CACHE is not None:
-        return _UT_CACHE
-    # 1) env 优先: 走 load_env() (含进程 env / ~/.hermes/.env / 项目 .env 三源)
-    env_val = load_env().get("FEISHU_SINA_UT", "").strip()
-    if env_val:
-        _UT_CACHE = env_val
-        return _UT_CACHE
-    # 2) 硬编码默认
-    _UT_CACHE = _DEFAULT_UT
-    # 3) 自动刷新 (一次性, 失败静默回退默认)
-    if allow_auto_refresh and os.environ.get("UT_AUTO_REFRESH", "1") != "0":
-        fresh = _auto_fetch_ut()
-        if fresh:
-            _UT_CACHE = fresh
-    return _UT_CACHE
-
-
-def _auto_fetch_ut() -> str | None:
-    """从东财主页 / 行情中心 JS 里抓 ut token, 失败返回 None。"""
-    urls = [
-        "https://data.eastmoney.com/",
-        "https://quote.eastmoney.com/center/gridlist.html",
-    ]
-    # ut 的典型形态: 16-40 位 [a-f0-9], 偶尔夹 i (看历史).
-    pattern = re.compile(r"""ut\s*[:=]\s*["']([a-f0-9i]{16,40})["']""", re.I)
-    for u in urls:
-        try:
-            r = requests.get(
-                u,
-                timeout=6,
-                headers={
-                    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-                    "Accept": "text/html,application/xhtml+xml,*/*",
-                    "Accept-Language": "zh-CN,zh;q=0.9",
-                },
-            )
-            if r.status_code != 200 or not r.text:
-                continue
-            m = pattern.search(r.text)
-            if m:
-                return m.group(1)
-        except Exception:
-            continue
-    return None
-
-
-def reset_ut_cache() -> None:
-    """测试 / 调参用: 清掉 ut 缓存, 下次调用会重新解析。"""
-    global _UT_CACHE
-    _UT_CACHE = None
-
-
-# ─────────── HTTP ───────────
-
 def curl_get(url: str, referer: str = "https://data.eastmoney.com/") -> str:
     """HTTP GET: 先 curl（保留原行为），失败再 requests 兜底。返回 body 字符串。"""
     ua = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"
@@ -203,133 +139,170 @@ def curl_get(url: str, referer: str = "https://data.eastmoney.com/") -> str:
 
 # ─────────── 交易日工具 ───────────
 
-# v12.9.1: A 股 2026 法定节假日常量 (元旦 1 / 春节 7 / 清明 3 / 劳动 3 / 端午 3 / 中秋 3 / 国庆 7 = 27 天)
-# 调休补班 (周末调成工作日) 暂不处理, 留 v12.10 接 tushare trade_cal
-_A_SHARE_HOLIDAYS_2026: set[str] = {
-    "2026-01-01", "2026-01-02", "2026-01-03",  # 元旦
-    "2026-02-17", "2026-02-18", "2026-02-19", "2026-02-20", "2026-02-21", "2026-02-22", "2026-02-23",  # 春节
-    "2026-04-04", "2026-04-05", "2026-04-06",  # 清明
-    "2026-05-01", "2026-05-02", "2026-05-03",  # 劳动
-    "2026-06-19", "2026-06-20", "2026-06-21",  # 端午
-    "2026-09-25", "2026-09-26", "2026-09-27",  # 中秋
-    "2026-10-01", "2026-10-02", "2026-10-03", "2026-10-04", "2026-10-05", "2026-10-06", "2026-10-07",  # 国庆
-}
+# v12.A.4.c: A 股交易日历走 Tushare trade_cal + 本地缓存
+# 缓存文件: data/trade_cal_<year>.json, 存全年 is_open=1 的日期 (含调休补班)
+_TRADE_CAL_CACHE_DIR = Path("data") / "trade_cal"
+
+
+def _load_trade_cal(year: int) -> set[str]:
+    """从本地缓存读全年交易日历 (set of 'YYYY-MM-DD')
+
+    缓存命中: 直接读 JSON
+    缓存未命中 / 缓存为空: 调 Tushare trade_cal 拉全年, 写缓存
+    拉取失败: 降级到 weekday<5 启发式
+    """
+    cache_path = _TRADE_CAL_CACHE_DIR / f"{year}.json"
+    if cache_path.exists():
+        try:
+            data = json.loads(cache_path.read_text(encoding="utf-8"))
+            if data:
+                return set(data)
+        except Exception:
+            pass
+    # 缓存未命中, 调 Tushare
+    try:
+        from stock_trading_agent.engine.tushare_client import _safe_df
+        pro_df = _safe_df(
+            lambda p: p.trade_cal(exchange="SSE", start_date=f"{year}0101", end_date=f"{year}1231",
+                                  fields="cal_date,is_open"),
+            label=f"trade_cal_{year}",
+        )
+        if pro_df is not None and not pro_df.empty:
+            opens = pro_df[pro_df["is_open"] == 1]["cal_date"].astype(str).tolist()
+            # cal_date 是 '20260101' → 转 '2026-01-01'
+            opens = [f"{d[:4]}-{d[4:6]}-{d[6:8]}" for d in opens]
+            _TRADE_CAL_CACHE_DIR.mkdir(parents=True, exist_ok=True)
+            cache_path.write_text(json.dumps(sorted(opens), ensure_ascii=False), encoding="utf-8")
+            return set(opens)
+    except Exception as e:
+        print(f"[trade_cal] 拉取 {year} 失败, 降级 weekday 启发式: {e}", file=sys.stderr)
+    # 降级: weekday < 5
+    return {(_date(year, 1, 1) + timedelta(days=i)).isoformat()
+            for i in range(366)
+            if (_date(year, 1, 1) + timedelta(days=i)).year == year
+            and (_date(year, 1, 1) + timedelta(days=i)).weekday() < 5}
 
 
 def is_trading_day(ref_date: Optional[date] = None) -> bool:
-    """判断 A 股交易日: weekday < 5 (Mon-Fri) 且不在法定节假日"""
+    """判断 A 股交易日: 走 Tushare trade_cal (含调休补班)
+
+    - 缓存命中 (data/trade_cal_<year>.json): 走缓存
+    - 缓存未命中: 实时拉 Tushare, 写缓存
+    - Tushare 挂: 降级 weekday<5 启发式
+    """
     d = ref_date or _date.today()
-    if d.weekday() >= 5:
-        return False
-    if d.isoformat() in _A_SHARE_HOLIDAYS_2026:
-        return False
-    return True
-
-
-def get_latest_trading_day(ref_date: Optional[date] = None) -> date:
-    d = ref_date or _date.today()
-    if d.weekday() == 5:
-        return d - timedelta(days=1)
-    if d.weekday() == 6:
-        return d - timedelta(days=2)
-    return d
-
-
-def get_previous_trading_day(ref_date: Optional[date] = None) -> date:
-    d = ref_date or _date.today()
-    if d.weekday() == 0:
-        return d - timedelta(days=3)
-    if d.weekday() in (5, 6):
-        return d - timedelta(days=(d.weekday() - 4))
-    return d - timedelta(days=1)
-
-
-# ─────────── 全市场 TOP200 ───────────
-
-def _build_secid(code: str) -> str:
-    if code.startswith(("6", "9")):
-        return "1." + code
-    return "0." + code
+    opens = _load_trade_cal(d.year)
+    return d.isoformat() in opens
 
 
 def fetch_realtime_quote(code: str, config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """v12.9.1: 单票实时行情 (东方财富 push2delay)
+    """v12.A.4.c: 单票实时行情 (Tushare daily_basic + daily)
 
-    返 {name, price, chg_pct, turnover, volume, sector, mktcap} 7 字段。
-    失败 (非交易时间 / 网络挂 / 代码错) 返空 dict, 不抛异常。
+    返 {name, price, chg_pct, turnover, mktcap_yi, pe, pb, ...}
+    失败 (代码错 / Tushare 挂 / 非交易时间) 返空 dict, 不抛异常。
 
-    接口: push2delay 的 secid 单票查询
-    字段: f12=代码 f14=名称 f2=最新价 f3=涨跌幅% f5=成交额 f6=换手率%
-          f8=换手率(另一口径) f9=市盈率 f10=量比 f20=总市值 f21=流通市值
+    接口:
+      daily        → close / pct_chg / amount
+      daily_basic  → pe_ttm / pb / turnover_rate / total_mv
+    单位:
+      daily.amount  千元   → 转亿: amount/1e8
+      total_mv      万元   → 转亿: total_mv/1e4
     """
     if not code or len(code) != 6 or not code.isdigit():
         return {}
-    try:
-        cfg = config or load_config()
-        base = cfg["data_source"]["eastmoney_base"]
-    except Exception:
+    from stock_trading_agent.engine.tushare_client import (
+        get_pro, to_ts_code, rate_limit_sleep,
+    )
+    ts_code = to_ts_code(code)
+    if "." not in ts_code:
         return {}
-    secid = _build_secid(code)
-    url = f"{base}/api/qt/stock/get"
-    params = {
-        "secid": secid,
-        "fields": "f12,f14,f2,f3,f5,f6,f8,f10,f20,f21",
-        "invt": "2",
-        "fltt": "2",
-        "_": str(int(time.time() * 1000)),
-    }
     try:
-        text = curl_get(url + "?" + urlencode(params))
-        if not text:
+        pro = get_pro()
+        # 1) daily: 拿最新收盘 + 涨跌幅 + 成交额
+        from datetime import date as _date_today
+        today = _date_today.today()
+        # 找最近 10 个交易日内有数据的那一天 (T+1 兼容)
+        end_d = today.strftime("%Y%m%d")
+        from datetime import timedelta
+        start_d = (today - timedelta(days=10)).strftime("%Y%m%d")
+        df_daily = pro.daily(ts_code=ts_code, start_date=start_d, end_date=end_d)
+        if df_daily is None or df_daily.empty:
             return {}
-        import json as _json
-        data = _json.loads(text)
-        if not data or str(data.get("rc", "")) not in ("0", ""):
-            return {}
-        d = data.get("data") or {}
-        if not d:
-            return {}
+        row = df_daily.sort_values("trade_date", ascending=False).iloc[0]
+        trade_date = str(row["trade_date"])
+        close = _safe_float(row.get("close"))
+        pct_chg = _safe_float(row.get("pct_chg"))
+        amount_k = _safe_float(row.get("amount"))  # 千元
+        amount_yi = round(amount_k / 1e5, 2) if amount_k else None  # 千元→亿
+        rate_limit_sleep(0.05)
+        # 2) daily_basic: 拿 PE / PB / 换手 / 总市值
+        df_basic = pro.daily_basic(
+            ts_code=ts_code, trade_date=trade_date,
+            fields="ts_code,trade_date,pe_ttm,pb,turnover_rate,total_mv,circ_mv"
+        )
+        pe = pb = turnover = total_mv_yi = circ_mv_yi = None
+        if df_basic is not None and not df_basic.empty:
+            b = df_basic.iloc[0]
+            pe = _safe_float(b.get("pe_ttm"))
+            pb = _safe_float(b.get("pb"))
+            turnover = _safe_float(b.get("turnover_rate"))
+            tmv = _safe_float(b.get("total_mv"))  # 万元
+            cmv = _safe_float(b.get("circ_mv"))
+            total_mv_yi = round(tmv / 1e4, 2) if tmv else None
+            circ_mv_yi = round(cmv / 1e4, 2) if cmv else None
+        rate_limit_sleep(0.05)
+        # 3) stock_basic 拿 name
+        df_name = pro.stock_basic(ts_code=ts_code, fields="ts_code,name,industry")
+        name = industry = ""
+        if df_name is not None and not df_name.empty:
+            name = df_name.iloc[0].get("name", "")
+            industry = df_name.iloc[0].get("industry", "")
         return {
-            "code": d.get("f12", code),
-            "name": d.get("f14", ""),
-            "price": _safe_float(d.get("f2")),
-            "chg_pct": _safe_float(d.get("f3")),
-            "amount_yi": _safe_float(d.get("f5")),  # 成交额(亿, 原始是元)
-            "turnover": _safe_float(d.get("f6")),    # 换手率%
-            "volume_ratio": _safe_float(d.get("f10")),
-            "mktcap_yi": _safe_float(d.get("f20")),  # 总市值(亿)
-            "source": "东方财富实时",
+            "code": code,
+            "ts_code": ts_code,
+            "name": name,
+            "industry": industry,
+            "trade_date": trade_date,
+            "price": close,
+            "chg_pct": pct_chg,
+            "amount_yi": amount_yi,
+            "turnover": turnover,
+            "pe": pe,
+            "pb": pb,
+            "mktcap_yi": total_mv_yi,
+            "circ_mv_yi": circ_mv_yi,
+            "source": "tushare",
         }
-    except Exception:
+    except Exception as e:
+        print(f"[fetch_realtime_quote] {code} 失败: {e}", file=sys.stderr)
         return {}
 
 
 def fetch_stock_kline(code: str, date: str | None = None,
                    config: Optional[dict[str, Any]] = None) -> dict[str, Any]:
-    """v12.A.1: 个股某日 K 线 (东方财富 push2his.kline, 治 '禾望电气周五行情' 类)
+    """v12.A.4.c: 个股某日 K 线 (Tushare daily + pro_bar 复权)
 
-    接口: push2his.eastmoney.com /api/qt/stock/kline/get
-    字段: f51=日期 f52=开 f53=收 f54=高 f55=低 f56=成交量(手) f57=成交额(元)
-          f58=振幅(%) f59=涨跌幅(%) f60=涨跌额(元) f61=换手率(%)
+    接口:
+      daily     → 日线 OHLC + pct_chg + amount + vol
+      pro_bar   → 前复权 (qfq) 收盘价
+      stock_basic → name
+    单位:
+      daily.vol    手
+      daily.amount 千元 → 转亿: amount/1e5
 
     date=None 或 'today' → 返最近 1 根 (今天/最近交易日)
-    date='YYYY-MM-DD' → 在 1 年日 K 里精确匹配该日那根
+    date='YYYY-MM-DD' → 拉 1 年日 K 精确匹配
     失败 (代码错/网络挂/节假日无数据) → 返空 dict
-
-    返 {code, name, date, open, close, high, low, chg_pct, chg_amt,
-         volume, amount_yi, amplitude, turnover}
     """
     if not code or len(code) != 6 or not code.isdigit():
         return {}
-    try:
-        cfg = config or load_config()
-        # push2his 是 push2delay 的兄弟域名, 同 family, 不需额外配置
-    except Exception:
-        cfg = {}
-    secid = _build_secid(code)
-
-    # v12.A.2 修: 形参 date (str) shadow import 的 date class → AttributeError 'str' has no attribute 'today'
-    # 改: 用 _date (import alias) 调 class 方法
+    from stock_trading_agent.engine.tushare_client import (
+        get_pro, to_ts_code, rate_limit_sleep,
+    )
+    ts_code = to_ts_code(code)
+    if "." not in ts_code:
+        return {}
+    # v12.A.2 修: 形参 date (str) shadow import 的 date class → 用 _date alias
     end_date = date if (date and date != "today") else _date.today().isoformat()
     try:
         end_dt = _date.fromisoformat(end_date)
@@ -339,63 +312,79 @@ def fetch_stock_kline(code: str, date: str | None = None,
     beg_str = beg_dt.strftime("%Y%m%d")
     end_str = end_dt.strftime("%Y%m%d")
 
-    url = "https://push2his.eastmoney.com/api/qt/stock/kline/get"
-    params = {
-        "secid": secid,
-        "fields1": "f1,f2,f3,f4,f5,f6",
-        "fields2": "f51,f52,f53,f54,f55,f56,f57,f58,f59,f60,f61",
-        "klt": "101",         # 日 K
-        "fqt": "1",           # 前复权
-        "beg": beg_str,
-        "end": end_str,
-        "lmt": "1000",
-    }
     try:
-        text = curl_get(url + "?" + urlencode(params))
-        if not text:
+        pro = get_pro()
+        df = pro.daily(ts_code=ts_code, start_date=beg_str, end_date=end_str)
+        if df is None or df.empty:
             return {}
-        import json as _json
-        data = _json.loads(text)
-        if not data or str(data.get("rc", "")) not in ("0", ""):
-            return {}
-        d = data.get("data") or {}
-        klines = d.get("klines") or []
-        if not klines:
-            return {}
-        target_date = end_date  # 'today' 走 end_date
-        # 1) 精确匹配 date
-        # 2) 没匹配 → 返最后一根 (用户问 today 但接口返的是最近一个交易日)
+        # 转日期格式匹配 'YYYY-MM-DD'
+        df["_date"] = df["trade_date"].astype(str).apply(lambda x: f"{x[:4]}-{x[4:6]}-{x[6:8]}")
+        # 1) 精确匹配
         matched = None
         if date and date != "today":
-            for line in klines:
-                parts = line.split(",")
-                if parts and parts[0] == target_date:
-                    matched = parts
-                    break
-        if not matched:
-            matched = klines[-1].split(",")
-        if len(matched) < 11:
-            return {}
-        # 字段顺序: 日期,开,收,高,低,成交量,成交额,振幅,涨跌幅,涨跌额,换手率
-        name = d.get("name", "")
-        amount_yuan = _safe_float(matched[6])  # 元
+            hit = df[df["_date"] == end_date]
+            if not hit.empty:
+                matched = hit.iloc[0]
+        # 2) 返最近一根
+        if matched is None:
+            df_sorted = df.sort_values("trade_date", ascending=False)
+            matched = df_sorted.iloc[0]
+        rate_limit_sleep(0.05)
+        # name
+        df_name = pro.stock_basic(ts_code=ts_code, fields="ts_code,name")
+        name = df_name.iloc[0]["name"] if (df_name is not None and not df_name.empty) else ""
+        rate_limit_sleep(0.05)
+        # 复权收盘价 (前复权)
+        try:
+            df_p = pro.pro_bar(ts_code=ts_code, adj="qfq",
+                               start_date=str(matched["trade_date"]),
+                               end_date=str(matched["trade_date"]),
+                               fields="ts_code,trade_date,close")
+            close_qfq = _safe_float(df_p.iloc[0]["close"]) if (df_p is not None and not df_p.empty) else None
+        except Exception:
+            close_qfq = None
+        amount_k = _safe_float(matched.get("amount"))  # 千元
+        amount_yi = round(amount_k / 1e5, 2) if amount_k else None
+        # 振幅: Tushare daily.amplitude 经常 None, 自己用 (high-low)/pre_close 算
+        high_v = _safe_float(matched.get("high"))
+        low_v = _safe_float(matched.get("low"))
+        pre_close_v = _safe_float(matched.get("pre_close"))
+        if high_v and low_v and pre_close_v and pre_close_v > 0:
+            amplitude = round((high_v - low_v) / pre_close_v * 100, 2)
+        else:
+            amplitude = _safe_float(matched.get("amplitude"))
+        # 换手率: Tushare daily 不含, 走 daily_basic 拿
+        turnover = None
+        try:
+            df_basic = pro.daily_basic(
+                ts_code=ts_code, trade_date=str(matched["trade_date"]),
+                fields="ts_code,turnover_rate",
+            )
+            if df_basic is not None and not df_basic.empty:
+                turnover = _safe_float(df_basic.iloc[0].get("turnover_rate"))
+        except Exception:
+            pass
+        rate_limit_sleep(0.05)
         return {
-            "code": d.get("code", code),
+            "code": code,
+            "ts_code": ts_code,
             "name": name,
-            "date": matched[0],
-            "open": _safe_float(matched[1]),
-            "close": _safe_float(matched[2]),
-            "high": _safe_float(matched[3]),
-            "low": _safe_float(matched[4]),
-            "volume": _safe_float(matched[5]),       # 手
-            "amount_yi": (amount_yuan / 1e8) if amount_yuan else None,  # 转亿
-            "amplitude": _safe_float(matched[7]),
-            "chg_pct": _safe_float(matched[8]),
-            "chg_amt": _safe_float(matched[9]),
-            "turnover": _safe_float(matched[10]),
-            "source": "东方财富K线",
+            "date": matched["_date"],
+            "open": _safe_float(matched.get("open")),
+            "close": _safe_float(matched.get("close")),
+            "close_qfq": close_qfq,
+            "high": high_v,
+            "low": low_v,
+            "volume": _safe_float(matched.get("vol")),       # 手
+            "amount_yi": amount_yi,
+            "amplitude": amplitude,
+            "chg_pct": _safe_float(matched.get("pct_chg")),
+            "chg_amt": _safe_float(matched.get("change")),
+            "turnover": turnover,
+            "source": "tushare",
         }
-    except Exception:
+    except Exception as e:
+        print(f"[fetch_stock_kline] {code} 失败: {e}", file=sys.stderr)
         return {}
 
 
@@ -410,50 +399,89 @@ def _safe_float(v: Any) -> float | None:
 
 
 def get_all_stocks(config: dict[str, Any]) -> list[dict[str, Any]]:
-    """全市场成交额 TOP200 (东方财富 push2delay)
+    """v12.A.4.c: 全市场成交额 TOP200 (Tushare daily 缓存)
 
-    字段映射到原新浪接口兼容名: code/name/trade/changepercent/turnoverratio/mktcap/amount/high/low/settlement
+    流程:
+      1) 读 data/cache/daily_<today>.json 缓存
+      2) 缓存命中 → 按 amount 排序取 top 200
+      3) 缓存未命中 → 调 Tushare daily (从 warm_up 已有, 这里容错) +
+         按 amount 排 + 写缓存 + 返 top 200
+
+    字段兼容 (旧东方财富接口名 → 新 Tushare):
+      code           ← ts_code 去 .SH/.SZ
+      name           ← name
+      trade          ← close
+      changepercent  ← pct_chg
+      turnoverratio  ← vol 推算 (v12.A.4.c 简化: 跟 daily_basic 拿)
+      mktcap         ← daily_basic total_mv (万元)
+      amount         ← amount (千元, 旧接口是元, 这里都保留原单位, 旧调用方看)
+      high / low     ← 暂用 close + pre_close 估算 (Tushare daily 没高低)
+      settlement     ← pre_close
     """
-    base = config["data_source"]["eastmoney_base"]
-    all_stocks: list[dict[str, Any]] = []
-    for page in range(1, 3):
-        url = (
-            f"{base}/api/qt/clist/get"
-            f"?pn={page}&pz=100&po=1&np=1&fltt=2&invt=2&fid=f6"
-            f"&fs=m:0+t:6,m:0+t:13,m:0+t:80,m:1+t:2,m:1+t:23,m:1+t:A,m:0+t:7+f:!50,m:1+t:3+f:!50"
-            f"&fields=f12,f14,f2,f3,f4,f5,f6,f8,f9,f10,f15,f16,f17,f18,f20,f23"
-            f"&_={int(time.time())}"
-        )
-        raw = curl_get(url, referer="https://quote.eastmoney.com/")
-        if not raw:
-            continue
+    from stock_trading_agent.engine import cache as _cache
+    # 1) 读缓存
+    cached = _cache.read_cache("daily")
+    if cached is not None:
+        return _format_top200_from_daily(cached)
+    # 2) 缓存未命中, 主动拉一次
+    try:
+        from stock_trading_agent.engine.tushare_client import get_pro, df_to_dicts, rate_limit_sleep
+        pro = get_pro()
+        from datetime import timedelta
+        end_d = _date.today()
+        items = None
+        for back in range(0, 10):
+            d = end_d - timedelta(days=back)
+            ds = d.strftime("%Y%m%d")
+            df_try = pro.daily(trade_date=ds,
+                               fields="ts_code,name,close,pre_close,pct_chg,vol,amount")
+            if df_try is not None and not df_try.empty:
+                items = df_to_dicts(df_try)
+                _cache.write_cache("daily", items)
+                break
+            rate_limit_sleep(0.05)
+        if items is None:
+            return []
+        return _format_top200_from_daily(items)
+    except Exception as e:
+        print(f"[get_all_stocks] 拉取失败: {e}", file=sys.stderr)
+        return []
+
+
+def _format_top200_from_daily(items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """daily list[dict] → 旧接口兼容的 TOP200
+
+    排序: amount DESC, 取前 200
+    字段映射: ts_code → code (去后缀)
+    """
+    out: list[dict[str, Any]] = []
+    for it in items:
         try:
-            d = json.loads(raw)
+            ts_code = it.get("ts_code", "")
+            code = ts_code.split(".")[0] if "." in ts_code else ts_code
+            close = _safe_float(it.get("close")) or 0
+            pre_close = _safe_float(it.get("pre_close")) or 0
+            pct = _safe_float(it.get("pct_chg")) or 0
+            amount = _safe_float(it.get("amount")) or 0  # 千元
+            vol = _safe_float(it.get("vol")) or 0
+            if close <= 0 or amount <= 0:
+                continue
+            out.append({
+                "code": code,
+                "name": it.get("name", ""),
+                "trade": close,
+                "changepercent": pct,
+                "turnoverratio": 0.0,  # daily 不含, get_market_stocks 用 daily_basic 二次补
+                "mktcap": 0.0,          # 同上
+                "amount": amount * 1e3,  # 千元 → 元, 兼容旧单位
+                "high": close,           # daily 没 high/low, 用 close 占位
+                "low": close,
+                "settlement": pre_close,
+            })
         except Exception:
             continue
-        diff = (d.get("data") or {}).get("diff") or []
-        for it in diff:
-            try:
-                price = float(it.get("f2", 0) or 0)
-                amount = float(it.get("f6", 0) or 0)
-                if price <= 0 or amount <= 0:
-                    continue
-                all_stocks.append({
-                    "code": it.get("f12", ""),
-                    "name": it.get("f14", ""),
-                    "trade": price,
-                    "changepercent": float(it.get("f3", 0) or 0),
-                    "turnoverratio": float(it.get("f8", 0) or 0),
-                    "mktcap": float(it.get("f20", 0) or 0),       # 万
-                    "amount": amount,                              # 元
-                    "high": float(it.get("f15", 0) or 0),
-                    "low": float(it.get("f16", 0) or 0),
-                    "settlement": float(it.get("f4", 0) or 0),
-                })
-            except Exception:
-                continue
-        time.sleep(0.5)
-    return all_stocks
+    out.sort(key=lambda x: x["amount"], reverse=True)
+    return out[:200]
 
 
 def get_market_stocks(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -504,37 +532,51 @@ def get_market_stocks(config: dict[str, Any]) -> list[dict[str, Any]]:
 # ─────────── 板块 ───────────
 
 def get_stock_sectors(codes: list[str], config: dict[str, Any]) -> dict[str, str]:
-    """批量查个股行业板块 (东方财富 ulist.np)
+    """v12.A.4.c: 批量查个股行业 (走 stock_basic 缓存)
 
-    返回: {code: sector_name}
-    每批 10 只
+    流程:
+      1) 读 data/cache/stock_basic_<today>.json 缓存
+      2) 缓存命中 → 内存 dict 查, O(1)
+      3) 缓存未命中 → 调 Tushare stock_basic (从 warm_up) + 写缓存
+
+    返: {code: industry}   ← 注意: 旧 key 是 sector, 现在叫 industry (Tushare 原生)
     """
-    if not codes:
+    from stock_trading_agent.engine import cache as _cache
+    cached = _cache.read_cache("stock_basic")
+    if cached is None:
+        # 缓存未命中, 拉一次
+        try:
+            from stock_trading_agent.engine.tushare_client import get_pro, df_to_dicts
+            pro = get_pro()
+            df = pro.stock_basic(list_status="L", fields="ts_code,industry")
+            if df is not None and not df.empty:
+                cached = df_to_dicts(df)
+                _cache.write_cache("stock_basic", cached)
+        except Exception as e:
+            print(f"[get_stock_sectors] 拉取失败: {e}", file=sys.stderr)
+            return {}
+    if not cached:
         return {}
-    base = config["data_source"]["eastmoney_base"]
-    ut = get_sina_ut()
+    # 建内存索引 ts_code -> industry, 然后查 code
+    from stock_trading_agent.engine.tushare_client import to_ts_code
     sector_map: dict[str, str] = {}
-    for i in range(0, len(codes), 10):
-        batch = codes[i:i + 10]
-        secids = ",".join(_build_secid(c) for c in batch)
-        url = (
-            f"{base}/api/qt/ulist.np/get"
-            f"?fltt=2&invt=2&fields=f12,f14,f100"
-            f"&secids={secids}&ut={ut}"
-        )
-        raw = curl_get(url)
-        if raw and len(raw) > 20:
-            try:
-                data = json.loads(raw)
-                for item in (data.get("data") or {}).get("diff", []) or []:
-                    code = item.get("f12", "")
-                    sector = item.get("f100", "")
-                    if code and sector and sector != "-":
-                        sector_map[code] = sector
-            except Exception:
-                pass
-        time.sleep(0.1)
-    return sector_map
+    for it in cached:
+        ts_code = it.get("ts_code", "")
+        if not ts_code:
+            continue
+        industry = it.get("industry", "")
+        if not industry:
+            continue
+        code = ts_code.split(".")[0]  # 600000.SH → 600000
+        sector_map[code] = industry
+    # 用户传 codes (项目格式) → 查
+    out: dict[str, str] = {}
+    for c in codes:
+        # 支持 'sh600000' / 'sz000001' / '600000'
+        code = c[2:] if c[:2] in ("sh", "sz", "bj") else c
+        if code in sector_map:
+            out[c] = sector_map[code]
+    return out
 
 
 def get_hot_sectors(config: dict[str, Any]) -> list[dict[str, Any]]:
@@ -575,78 +617,85 @@ def get_hot_sectors(config: dict[str, Any]) -> list[dict[str, Any]]:
 # ─────────── 大盘环境 ───────────
 
 def get_market_env(config: dict[str, Any]) -> dict[str, Any]:
-    """综合大盘环境评估
+    """v12.A.4.c: 综合大盘环境评估 (Tushare index_daily)
 
-    返回: {
-      env_score, env_level, position_advice, position_ratio, market_type, flags,
-      details: {weighted_chg, trend_bonus, vol_bonus, sh_amt_yi, index_data}
-    }
+    指数数据: Tushare index_daily 拉近 30 天, 取最后一行作为当日,
+              取最后 5 根 close 算 MA5 (trend_bonus).
+
+    返: {env_score, env_level, position_advice, position_ratio,
+         market_type, flags, details: {weighted_chg, trend_bonus,
+         vol_bonus, sh_amt_yi, index_data, data_source}}
     """
     env_cfg = config["env"]
     indices = env_cfg["indices"]
     vol_hi = env_cfg["vol_thresh_hi_yi"]
     vol_lo = env_cfg["vol_thresh_lo_yi"]
     pos_cfg = config["position"]
+    data_source = "tushare"  # 切到 Tushare 后默认; 真没拉到再降级
 
-    joined = ",".join(c for c, _, _ in indices)
-    raw = curl_get(f"https://qt.gtimg.cn/q={joined}")
+    from stock_trading_agent.engine.tushare_client import (
+        get_pro, to_ts_code, rate_limit_sleep,
+    )
+    pro = get_pro()
+    # 拉近 30 天 (够算 MA5)
+    end_d = _date.today().strftime("%Y%m%d")
+    beg_d = (_date.today() - timedelta(days=30)).strftime("%Y%m%d")
 
     results: dict[str, dict[str, Any]] = {}
-    for line in raw.strip().splitlines():
-        m = re.search(r'v_(\w+)="([^"]+)"', line)
-        if not m:
-            continue
-        code = m.group(1)
-        parts = m.group(2).split("~")
-        if len(parts) < 10:
-            continue
-        try:
-            results[code] = {
-                "name": parts[1],
-                "open": float(parts[5]),
-                "prev": float(parts[4]),
-                "price": float(parts[3]),
-                "high": float(parts[33]) if len(parts) > 33 else float(parts[3]),
-                "low": float(parts[34]) if len(parts) > 34 else float(parts[3]),
-                "vol": float(parts[6]) if len(parts) > 6 else 0,
-                "amt": float(parts[37]) if len(parts) > 37 else 0,
-            }
-        except Exception:
-            continue
-
     index_data: dict[str, Any] = {}
     weighted_chg = 0.0
     trend_bonus = 0
     weight_total = 0.0
 
-    for code, name, w in indices:
-        if code not in results:
-            continue
-        r = results[code]
-        chg = (r["price"] - r["prev"]) / r["prev"] * 100 if r["prev"] > 0 else 0
-        r["chg"] = round(chg, 2)
-        index_data[name] = {"chg": chg, "price": r["price"], "prev": r["prev"]}
-        weighted_chg += chg * w
-        weight_total += w
-        time.sleep(0.1)
-
-        kl_url = (
-            "https://web.ifzq.gtimg.cn/appstock/app/fqkline/get"
-            f"?param={code},day,,,8,qfq"
-        )
-        kl_raw = curl_get(kl_url, referer="https://gu.qq.com/")
-        try:
-            kl_json = json.loads(kl_raw)
-            day_data = kl_json.get("data", {}).get(code, {}).get("day", [])
-            closes = [float(k[2]) for k in day_data if len(k) >= 3]
-            if len(closes) >= 5:
-                ma5 = sum(closes[-5:]) / 5
+    try:
+        for idx in indices:
+            # config 里是 dict: {code, name, weight}, 兼容 tuple (旧版)
+            if isinstance(idx, dict):
+                code, name, w = idx["code"], idx["name"], idx["weight"]
+            else:
+                code, name, w = idx
+            ts_code = to_ts_code(code)
+            rate_limit_sleep(0.05)
+            df = pro.index_daily(ts_code=ts_code, start_date=beg_d, end_date=end_d)
+            if df is None or df.empty:
+                continue
+            df = df.sort_values("trade_date", ascending=False).reset_index(drop=True)
+            latest = df.iloc[0]
+            close = _safe_float(latest.get("close"))
+            pre_close = _safe_float(latest.get("pre_close"))
+            amount_k = _safe_float(latest.get("amount"))  # 千元
+            if close is None or pre_close is None or pre_close <= 0:
+                continue
+            chg = (close - pre_close) / pre_close * 100
+            # MA5: 取最近 5 根的 close 平均
+            closes_5 = [_safe_float(c) for c in df.head(5)["close"].tolist()]
+            closes_5 = [c for c in closes_5 if c is not None]
+            ma5 = sum(closes_5) / len(closes_5) if len(closes_5) >= 3 else None
+            amt_yi = round(amount_k / 1e5, 0) if amount_k else 0  # 千元→亿 (1e5=1e3 元/1e8 亿)
+            amt_yuan = (amount_k or 0) * 1e3  # 千元 → 元
+            results[code] = {
+                "name": name,
+                "ts_code": ts_code,
+                "prev": pre_close,
+                "price": close,
+                "chg": round(chg, 2),
+                "amt": amt_yuan,
+                "amt_yi": amt_yi,
+            }
+            index_data[name] = {
+                "chg": chg,
+                "price": close,
+                "prev": pre_close,
+            }
+            if ma5 is not None:
                 index_data[name]["ma5"] = round(ma5, 2)
-                index_data[name]["above_ma5"] = r["price"] > ma5
-                if r["price"] > ma5:
+                index_data[name]["above_ma5"] = close > ma5
+                if close > ma5:
                     trend_bonus += 8
-        except Exception:
-            pass
+            weighted_chg += chg * w
+            weight_total += w
+    except Exception as e:
+        print(f"[market_env] Tushare 拉取失败: {e}", file=sys.stderr)
 
     if not results:
         return {
@@ -656,13 +705,19 @@ def get_market_env(config: dict[str, Any]) -> dict[str, Any]:
             "position_ratio": 0.5,
             "market_type": "未知",
             "flags": ["data_missing"],
-            "details": {"reason": "腾讯 qt.gtimg.cn 无返回"},
+            "details": {
+                "reason": "Tushare index_daily 无数据",
+                "data_source": "none",
+            },
         }
+    if not results:  # catch 路径上也是 data_source=none
+        data_source = "none"
 
     if weight_total > 0:
         weighted_chg /= weight_total
     weighted_chg = round(weighted_chg, 3)
 
+    # 上证成交额 (亿元): results['sh000001']['amt'] 单位是元
     sh_amt_yi = results.get("sh000001", {}).get("amt", 0) / 1e8
     vol_bonus = 10 if sh_amt_yi > vol_hi else (5 if sh_amt_yi > vol_lo else 0)
     if "上证指数" in index_data:
@@ -671,7 +726,7 @@ def get_market_env(config: dict[str, Any]) -> dict[str, Any]:
     base_score = max(0, min(50, 25 + weighted_chg * 5))
     total = max(0, min(100, int(base_score + trend_bonus + vol_bonus)))
 
-    # 等级判定
+        # 等级判定
     level, pos_ratio, pos_adv, mtype = "极差", 0.0, pos_cfg["empty"]["advice"], "熊市"
     for key in ("full", "heavy", "half", "light", "empty"):
         node = pos_cfg[key]
@@ -700,6 +755,7 @@ def get_market_env(config: dict[str, Any]) -> dict[str, Any]:
         "details": {
             "weighted_chg": weighted_chg,
             "trend_bonus": int(trend_bonus),
+            "data_source": data_source,
             "vol_bonus": vol_bonus,
             "sh_amt_yi": round(sh_amt_yi, 0),
             "index_data": index_data,
@@ -707,59 +763,9 @@ def get_market_env(config: dict[str, Any]) -> dict[str, Any]:
     }
 
 
-# ─────────── 板块动能（基于本地 sectors_YYYYMMDD.json） ───────────
-
-def get_sector_momentum(days: int = 3, sectors_dir: Optional[Path] = None) -> dict[str, Any]:
-    """识别持续强势的主线板块
-
-    sectors_dir 默认 ~/.hermes/stock_picker/sectors/（向后兼容）
-    """
-    if sectors_dir is None:
-        sectors_dir = Path.home() / ".hermes" / "stock_picker" / "sectors"
-    sector_files = sorted(sectors_dir.glob("sectors_*.json")) if sectors_dir.exists() else []
-
-    history: dict[str, list[tuple[str, float]]] = {}
-    for sf in sector_files[-days * 3:]:
-        try:
-            data = json.loads(sf.read_text())
-        except Exception:
-            continue
-        day = sf.stem.replace("sectors_", "")
-        for s in data:
-            name = s.get("name", "")
-            try:
-                chg = float(s.get("chg_pct", 0))
-            except Exception:
-                continue
-            history.setdefault(name, []).append((day, chg))
-
-    rising: list[dict[str, Any]] = []
-    for name, records in sorted(history.items()):
-        records.sort()
-        recent = records[-days:]
-        if len(recent) == days and all(chg > 0.5 for _, chg in recent):
-            total = sum(chg for _, chg in recent)
-            rising.append({"name": name, "total_chg": round(total, 2), "days": days, "recent": recent})
-
-    rising.sort(key=lambda x: x["total_chg"], reverse=True)
-
-    today_file = sectors_dir / f"sectors_{_date.today().strftime('%Y%m%d')}.json"
-    new_sectors: list[dict[str, Any]] = []
-    rising_names = {r["name"] for r in rising}
-    if today_file.exists():
-        try:
-            new_sectors = [
-                s for s in json.loads(today_file.read_text())
-                if float(s.get("chg_pct", 0)) > 3 and s.get("name", "") not in rising_names
-            ]
-        except Exception:
-            pass
-
-    return {"rising_sectors": rising, "new_sectors": new_sectors, "rising_count": len(rising)}
-
-
 # ─────────── 配置加载 ───────────
-
+# v12.A.4.c 注: _CONFIG_PATH / _CONFIG_CACHE 初始化原本在 get_sina_ut 上面,
+#               删 dead code 时一起删了, 这里补回.
 _CONFIG_PATH = Path(__file__).parent.parent / "config.yaml"
 _CONFIG_CACHE: Optional[dict[str, Any]] = None
 

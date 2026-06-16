@@ -14,19 +14,21 @@ hard:
   max_picks: 15           # 最多推送只数
 
 # ─── 方案 A（精准）───
+# v3.1: 阈值放宽 (原 3-4% + 换手 8-10% 太严, 全市场满足的票少, 走 plan_c 兜底太多)
 plan_a:
-  chg_lo: 3.0
-  chg_hi: 4.0
-  turnover_lo: 8.0        # 换手率下限
-  turnover_hi: 10.0
+  chg_lo: 1.5
+  chg_hi: 5.0
+  turnover_lo: 3.0        # 换手率下限 (原 8.0)
+  turnover_hi: 15.0       # 换手率上限 (原 10.0)
   amplitude_hi: 8.0       # 振幅上限
 
 # ─── 方案 B（平衡）───
+# v3.1: 阈值放宽
 plan_b:
-  chg_lo: 3.0
-  chg_hi: 4.0
-  turnover_lo: 6.0
-  turnover_hi: 10.0
+  chg_lo: 0.5
+  chg_hi: 7.0
+  turnover_lo: 1.0        # 原 6.0
+  turnover_hi: 20.0       # 原 10.0
   amplitude_hi: 8.0
 
 # ─── v3 调参（2026-06-06 深度复盘后落地）───

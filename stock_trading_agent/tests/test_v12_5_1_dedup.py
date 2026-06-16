@@ -158,11 +158,13 @@ def test_market_env_realtime_path() -> None:
 
 
 def test_market_env_failed_path() -> None:
-    from stock_trading_agent.engine import skills, data_fetcher
+    """v12.A.4.c: get_market_env 抛异常 → source=failed"""
+    from stock_trading_agent.engine import skills
     fake_conn = MagicMock()
     fake_conn.execute.return_value.fetchone.return_value = None
     with patch.object(skills, "get_db", return_value=fake_conn), \
-         patch.object(data_fetcher, "curl_get", side_effect=ConnectionError("net down")):
+         patch("stock_trading_agent.engine.data_fetcher.get_market_env",
+               side_effect=ConnectionError("net down")):
         r = skills._run_get_market_env({})
     assert r["source"] == "failed"
     assert r["env_level"] == "数据源不可用"

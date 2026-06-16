@@ -130,6 +130,25 @@ CREATE INDEX IF NOT EXISTS idx_positions_code ON paper_positions(code);
 CREATE INDEX IF NOT EXISTS idx_picks_date ON picks(pick_date);
 CREATE INDEX IF NOT EXISTS idx_params_changed_at ON params_history(changed_at);
 
+-- v12.A.4: 结构化复盘 (借鉴 felix reviews 表)
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    date TEXT NOT NULL,                 -- 复盘日期 YYYY-MM-DD
+    stock_code TEXT NOT NULL,           -- 股票代码
+    stock_name TEXT,                    -- 股票名称 (冗余便于读)
+    signal_id INTEGER,                  -- 关联的 signal (可选)
+    action_taken INTEGER NOT NULL DEFAULT 0,  -- 是否实操 0/1
+    reason TEXT NOT NULL DEFAULT '',    -- 操作理由 / 买入理由
+    result TEXT NOT NULL DEFAULT '',    -- 结果 (盈亏 % / 备注)
+    summary TEXT NOT NULL DEFAULT '',   -- 总结 / 反思
+    tags TEXT NOT NULL DEFAULT '[]',    -- JSON 数组 ["止盈","早盘冲高","题材退潮"]
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+CREATE INDEX IF NOT EXISTS idx_reviews_date ON reviews(date);
+CREATE INDEX IF NOT EXISTS idx_reviews_stock_code ON reviews(stock_code);
+CREATE INDEX IF NOT EXISTS idx_reviews_action_taken ON reviews(action_taken);
+
 -- v7.4: stage 依赖图运行记录
 CREATE TABLE IF NOT EXISTS stage_runs (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -641,6 +660,67 @@ def record_actual_trade(
     )
     conn.commit()
     return cur.rowcount
+
+
+# ─────────── 选股记录 (v3.1) ───────────
+
+def record_picks(pick_date: str, stocks: list[dict[str, Any]], plan_used: str,
+                 market_env_score: int | None = None, market_env_level: str | None = None) -> int:
+    """v3.1: stage_pick 末尾调用, 把今日选股结果写入 picks 表
+
+    之前: stage_pick 跑完只 push_pick 推飞书, picks 表永远空, 飞书问"今日选股" 看不到
+    现在: 推飞书前先 INSERT INTO picks, 飞书再问就能拿到同一份数据
+
+    Returns:
+        写入的票数
+    """
+    from datetime import datetime as _dt
+    conn = get_db()
+    now = _dt.now().isoformat(timespec="seconds")
+    written = 0
+    for s in stocks or []:
+        try:
+            conn.execute(
+                """
+                INSERT INTO picks(
+                    pick_date, code, name, price, prev_close, chg_pct,
+                    turnover, amplitude, score, sector, in_theme, plan,
+                    plan_used, market_env_score, market_env_level, created_at
+                ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                ON CONFLICT(pick_date, code) DO UPDATE SET
+                    price=excluded.price,
+                    chg_pct=excluded.chg_pct,
+                    turnover=excluded.turnover,
+                    score=excluded.score,
+                    sector=excluded.sector,
+                    plan_used=excluded.plan_used,
+                    market_env_score=excluded.market_env_score,
+                    market_env_level=excluded.market_env_level
+                """,
+                (
+                    pick_date,
+                    str(s.get("code", "")),
+                    str(s.get("name", "")),
+                    float(s.get("price", 0) or 0),
+                    float(s.get("prev_close", 0) or 0),
+                    float(s.get("chg_pct", 0) or 0),
+                    float(s.get("turnover", 0) or 0),
+                    float(s.get("amplitude", 0) or 0),
+                    float(s.get("score", 0) or 0),
+                    str(s.get("sector", "") or ""),
+                    1 if s.get("in_theme") else 0,
+                    plan_used,
+                    plan_used,
+                    market_env_score,
+                    market_env_level,
+                    now,
+                ),
+            )
+            written += 1
+        except Exception as e:  # noqa: BLE001
+            log.warning("record_picks 写 %s 失败: %s", s.get("code"), e)
+    conn.commit()
+    return written
 
 
 # ─────────── 查询 ───────────

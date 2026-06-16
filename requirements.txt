@@ -16,3 +16,10 @@ jinja2>=3.1
 cryptography>=41.0
 pyyaml>=6.0
 apscheduler>=3.10
+
+# v12.A.4.c: 全量数据源切 Tushare 代理
+# 安装: pip install tushare
+# 旧: 东方财富 push2 / push2delay / 腾讯 qt.gtimg.cn / 新浪 hq.sinajs.cn (全部废弃)
+# 新: Tushare 代理地址 (从 .env TUSHARE_PROXY_URL 读, 不硬编码)
+# 凭据: .env 里的 TUSHARE_TOKEN
+tushare>=1.4

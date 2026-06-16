@@ -32,6 +32,7 @@ DEFAULT_FACTS_PATH = Path("data/facts/stock_events.jsonl")
 PREDICATE_VOCAB = {
     "SELECTED",      # 选股
     "VALIDATED",     # 复盘验证
+    "REVIEWED",      # v12.A.4: 用户主动复盘
     "SUPERSEDED",    # 被新事实替代
     "INVALIDATED",   # 作废
     "TUNED",         # 调参

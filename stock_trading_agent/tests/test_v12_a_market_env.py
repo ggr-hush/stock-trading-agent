@@ -96,6 +96,20 @@ def test_parse_no_date_returns_none() -> None:
     assert _parse_relative_date("") is None
 
 
+def test_parse_chinese_date() -> None:
+    """v12.A.4.c hotfix: 6月16日 / 6月16号 → YYYY-MM-DD (治"6月16日选股" 不识别)"""
+    from stock_trading_agent.engine.skills import _parse_relative_date
+    today = datetime.date.today()
+    # 当年 6月16日: 未来 → 去年, 过去 → 今年
+    target = datetime.date(today.year, 6, 16)
+    if target > today:
+        target = datetime.date(today.year - 1, 6, 16)
+    expected = target.isoformat()
+    assert _parse_relative_date("6月16日选股") == expected
+    assert _parse_relative_date("6月16号行情") == expected
+    assert _parse_relative_date("06月16日 K线") == expected
+
+
 # ─────────── 2) _run_get_market_env with date ───────────
 
 def test_run_future_date_returns_future_label() -> None:

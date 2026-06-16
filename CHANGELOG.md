@@ -2,6 +2,117 @@
 
 本项目所有重要变更记录于此。格式遵循 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)。
 
+## [v12.A.4.c] - 2026-06-17
+
+**v3.1 选股策略: 治"今日选股 5 只票很垃圾, 有 -6% 票"**。A+B+C+D+E 一起做, 4 改 1 包。
+
+### 根因
+- **A 评分公式 bug**: `chg_score = min(abs(chg - 3.0) / 1.0, 1) * 20` 用了 `abs()`, 让跌 5% 票跟涨 3% 票同分 (跌 5% 偏离 8 → min(8,1)=1, * 20 = 20 分, **满分**)
+- **B 阈值太严**: plan_a/b 要求 3-4% 涨 + 8-10% 换手, 全市场 5000 只满足的不到 10 只, 几乎永远走 plan_c 兜底
+- **C plan_c 兜底无下限**: 任何 top200 票都进, 推低分冷门小盘股
+- **D stage_pick 不写 picks 表**: 飞书问"今日选股" 走 fallback 路径, 看不到推过的票
+
+### 4 改 1 包
+
+**A. 评分公式方向感知** (`engine/picker.py:_score_stock`)
+- 跌 (chg < 0) → chg_score = 0
+- 涨且 |chg-3| ≤ 1 → chg_score = 20 (满 20 分)
+- 偏离 3% 越远越低: `chg_score = max(20 - |chg-3| * 10, 0)`
+
+**B. plan_a/b 阈值放宽** (`config.yaml`)
+- plan_a: chg [1.5, 5.0) + 换手 [3, 15] (原 [3, 4) + [8, 10])
+- plan_b: chg [0.5, 7.0) + 换手 [1, 20] (原 [3, 4) + [6, 10])
+
+**C. plan_c 兜底收紧** (`engine/picker.py`)
+- 之前 plan_c = [] (空仓)
+- 现在 plan_c 路径: 从全池(非 hard_excl) 拿评分 ≥ 60 的高分票
+- 防止推低分冷门小盘股
+
+**D. stage_pick 写 picks 表** (`agent/stages.py:stage_pick` + `engine/paper_trader.py:record_picks`)
+- 之前: stage_pick 跑完只 push_pick 推飞书, picks 表永远空
+- 现在: 先 INSERT INTO picks (ON CONFLICT UPDATE), 再推飞书
+- 飞书问"今日选股" 能从 picks 表拿到跟推送一致的数据
+
+### Test
+- **新文件** `tests/test_v12_a_4_c_picker_v31.py` (8 个全绿): 评分方向感知 3 + 阈值放宽 2 + plan_c 兜底 1 + 写 picks 表 2
+- **picker 老 6 测试不退化** (test_picker.py 6/6 全绿)
+- **v12.A.* 全套**: regime 14/14 + reviews 12/12 + cache 8/8 + tushare 26/26 + picker_v31 8/8 = **68/68 全绿**
+- **paper_trader 4/4**: plan_c 不开仓仍然 OK (open_positions 在 plan_used=="C" 时早返 0)
+
+### 改动文件
+- **改 3 个**: `engine/picker.py` (_score_stock + plan_c 兜底) / `config.yaml` (plan_a/b 阈值) / `agent/stages.py` (stage_pick 调 record_picks) / `engine/paper_trader.py` (新加 record_picks 函数)
+- **新 1 个**: `tests/test_v12_a_4_c_picker_v31.py` (8 测试)
+
+### 端到端验证 (用户跑)
+- `bash deploy/install_launchd.sh restart`
+- 飞书发"今日选股" → 看到 score >= 60 的高分票, 不再有 -6% 票
+- 飞书发"今日选股" 多次 → 数据一致 (走 picks 表, 不再 fallback)
+
+
+### hotfix-1: 中文日期解析 + freeform 救场
+**问题**: 飞书发"6月16日选股" / "今日选股" 都回"没识别到您的意图"。
+
+- **A. 中文日期解析** (`engine/skills.py:_parse_relative_date`): 加正则 `(\d{1,2})月(\d{1,2})[日号]`, 支持 "6月16日" / "6月16号" / "06月16日"。未来日期自动减一年 (避免 6-16 现在报"还没到")
+- **B. freeform 救场** (`llm/tool_use.py:dispatch`): LLM 不选 tool 时, 先尝试 `keyword_fallback(text)` 救场, 命中就走 skill (新 path=`llm_tool_rescued`); 救不中才走老 freeform 兜底
+  - 治 "今日选股" LLM 偶尔不调 get_picks 工具 → 走 freeform 空响应 → 兜底成"没识别意图"
+- **C. 新 3 测试**: `test_parse_chinese_date` + `test_keyword_fallback_rescues_today_picks` + `test_no_keyword_match_falls_through_to_freeform`
+- **D. picks 表清理**: 清掉 test 残留 (整数 75.0/62.0/80.0), 实际 Mac 端会重写
+
+### hotfix-2: 5 只"很垃圾"票的根因
+**现象**: 飞书推的 5 只 (301376/301215/002195/301138/002488) chg_pct 全是 -0.7% ~ +2.3%, 全部是跌/微涨。
+
+**根因**: v3 plan_a/b 阈值 (chg 3-4% + 换手 8-10%) 全市场满足的票 < 10 只, 永远走 plan_c 兜底。plan_c 之前无下限, 任何 top200 票都进。
+
+**修复**: v3.1 plan_c 兜底收紧 — 只保留 score >= 60 的高分票。这 5 只票在 v3.1 下 score 全部 < 60, 全部被过滤 → 推"空仓"卡片。
+
+**Mac 端验证**: `bash deploy/install_launchd.sh restart` 后, 14:00 stage_pick 跑出来 plan_c = [] (无 ≥60 分票), 推 🔴 空仓日 卡片, 用户能立刻看到"今天没票"而不是"垃圾票 5 只"。
+
+---
+
+## [v12.A.4] - 2026-06-16
+
+借鉴 `docs/借鉴分析-felix-quant.md` #1 (5 档市场状态 + 决策模式) + #3 (结构化复盘)。**不学** #2 情绪数据 / #4 风险规则 / #5 数据快照 (推 v12.A.5+).
+
+### 借鉴 #1: Market Regime 5 档 + Decision Mode 决策树
+- **新文件** `engine/market_regime.py` (~148 行): `classify_regime(env)` 5 档 (Panic/RiskOff/Choppy/Recovery/RiskOn), `regime_to_mode` 候选数/高风险降档
+- **新文件** `engine/decision_engine.py` (~141 行): `build_daily_decision` 4 维仓位上限 (base/market/strategy_quality/decision_mode) 取 min, 返 4 档 mode (WAIT/DEFENSIVE_OBSERVE/WATCH/PROBE)
+- **改** `engine/skills.py:_run_get_market_env`: realtime 分支加 `regime` / `regime_zh` / `regime_reasons` 字段
+- **新 skill** `get_daily_decision`: 飞书问"今天能买吗" 触发, 返 5 档 regime + 4 档 mode + 仓位区间 + 允许/禁止动作 + 切换条件
+- **改** `agent/stages.py:stage_pick`: 跑选股前先调 decision engine, Panic/WAIT 模式直接 return (不跑选股)
+- **测试** `tests/test_v12_a_4_regime.py` (14 个全绿): 5 档分类 + 降档 + 4 维仓位 + skill 集成
+
+### 借鉴 #3: Reviews 表 + Skill + REVIEWED Fact
+- **新文件** `engine/reviews.py` (~240 行): `add_review` / `query_reviews` / `get_review` / `update_review` / `tag_count` / `parse_natural_review`
+- **改** `engine/paper_trader.py`: 新表 `reviews` (date/stock_code/stock_name/signal_id/action_taken/reason/result/summary/tags) + 3 索引
+- **改** `engine/temporal_facts.py`: PREDICATE_VOCAB 加 `REVIEWED`
+- **新 skill** `add_review`: 飞书 "加复盘: 002063 止盈 2.5% 早盘冲高" → 自然语言解析 → 落库 + 写 REVIEWED fact
+- **新 skill** `query_reviews`: 按 date/code/tag 查
+- **新 CLI** `agent review list` (轻量)
+- **测试** `tests/test_v12_a_4_reviews.py` (12 个全绿): CRUD + 自然语言解析 + skill 集成 + REVIEWED fact
+
+### 改动文件
+- **新增 4 个**: `engine/market_regime.py` / `engine/decision_engine.py` / `engine/reviews.py` + 2 测试套件
+- **改 5 个**: `engine/skills.py` (realtime 加 regime + 3 新 skill) / `engine/paper_trader.py` (新表) / `engine/temporal_facts.py` (REVIEWED predicate) / `agent/stages.py` (stage_pick 屏障) / `agent/cli.py` (review subcommand)
+
+### 端到端验证
+- Choppy (env=50) 模式 → stage_pick 正常跑选股 (mode=WATCH, 0/30% 仓位)
+- Panic (env=18) 模式 → stage_pick 跳过, return `{"skipped": "regime_wait", "regime": "Panic", ...}`
+- 飞书 "今天能买吗" → 返决策卡片 (regime + mode + 仓位 + 理由)
+- 飞书 "加复盘: 002063 止盈 2.5% 早盘冲高" → 落 reviews 表 #N + 写 REVIEWED fact
+- 飞书 "今日复盘" → 返今日 reviews 列表
+
+### Test
+- **v12.A.4 新增 26 测试全绿**: regime 14 + reviews 12
+- **老 234 测试 287/289 通过** (2 pre-existing 数据累积, 跟 v12.A.4 无关)
+
+### 不做的事 (推 v12.A.5+)
+- ❌ 情绪数据 (涨停/跌停/炸板) — 需 Tushare 付费
+- ❌ 风险规则表 (risk_rules) — 跟决策引擎一起做更顺
+- ❌ 数据快照 (dashboard_snapshots) — 大改, 推 v13
+- ❌ 财务因子 (PE/PB) — 跟短线选股关系弱
+
+---
+
 ## [v12.A.3] - 2026-06-13
 
 借鉴 `docs/借鉴分析-trading-review-wiki.md` 4 个可借鉴点, 一包发 v12.A.3。**不学** #5 桌面 app / 自动更新。

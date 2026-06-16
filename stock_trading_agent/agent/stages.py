@@ -19,6 +19,7 @@ from ..engine.paper_trader import (
     init_account,
     mark_stage_run,
     open_positions,
+    record_picks,
     was_stage_run_today,
 )
 from ..engine.picker import pick
@@ -120,8 +121,44 @@ def stage_pick() -> dict[str, Any]:
     if not is_trading_day():
         log.info("非交易日, 跳过选股")
         return {"skipped": "weekend"}
+    # v12.A.4: 跑选股前先看 regime, Panic/WAIT 模式不跑
+    try:
+        from ..engine.data_fetcher import get_market_env, load_config as _load_cfg_for_regime
+        from ..engine.market_regime import classify_regime
+        from ..engine.decision_engine import build_daily_decision
+        from datetime import date as _date_for_regime
+        cfg_regime = _load_cfg_for_regime()
+        env = get_market_env(cfg_regime)
+        regime_info = classify_regime(env)
+        decision = build_daily_decision(regime_info, candidate_count=0)
+        if decision["decisionMode"] == "WAIT":
+            log.info("stage_pick 跳过: regime=%s mode=WAIT (key_reasons=%s)",
+                     regime_info["regime"], decision.get("keyReasons", []))
+            return {"skipped": "regime_wait", "regime": regime_info["regime"],
+                    "decisionMode": "WAIT", "keyReasons": decision.get("keyReasons", [])}
+        log.info("stage_pick 决策: regime=%s mode=%s pos=%s-%s",
+                 regime_info["regime"], decision["decisionMode"],
+                 decision["positionMin"], decision["positionMax"])
+    except Exception as e:  # noqa: BLE001
+        log.warning("stage_pick regime 决策失败, 继续跑选股: %s", e)
     cfg = load_config()
     result = pick(cfg)
+    # v3.1: 先写 picks 表 (确保飞书问"今日选股"能拿到)
+    try:
+        env_score = result.get("market_env", {}).get("score")
+        env_level = result.get("market_env", {}).get("level", "")
+        pick_date = result.get("date", "")
+        n_written = record_picks(
+            pick_date=pick_date,
+            stocks=result.get("filtered_stocks", []),
+            plan_used=result["plan_used"],
+            market_env_score=env_score,
+            market_env_level=env_level,
+        )
+        log.info("stage_pick 写 picks 表: %d 只 (date=%s, plan=%s)",
+                 n_written, pick_date, result["plan_used"])
+    except Exception as e:  # noqa: BLE001
+        log.warning("stage_pick 写 picks 表失败 (继续): %s", e)
     n_open = open_positions(result, cfg)
     if result["plan_used"] == "C":
         env = result["market_env"]

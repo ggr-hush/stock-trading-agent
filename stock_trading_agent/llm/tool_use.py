@@ -343,6 +343,31 @@ def dispatch(
     # 2) LLM 成功, 检查 tool_calls
     tool_calls = resp.get("tool_calls", [])
     if not tool_calls:
+        # v12.A.4.c: LLM 没选 tool → 先尝试 keyword_fallback 救场 (治 "今日选股" 兜底成空响应)
+        # 之前: LLM 不调 tool → 走 freeform 兜底, 用户体感"没识别意图"
+        # 现在: 先看能不能命中关键词 → 调 skill, 调不中再走 freeform
+        try:
+            from ..engine.skills import keyword_fallback as _kf
+            _kb_skill = _kf(text)
+        except Exception:
+            _kb_skill = None
+        if _kb_skill:
+            log.info("LLM 未选 tool, keyword_fallback 救场: %s", _kb_skill)
+            from ..engine.skills import call_skill as _cs
+            _args = {"date": parsed_date} if parsed_date else {}
+            _r = _cs(_kb_skill, _args)
+            if _r.get("ok"):
+                _log_call("tool_use_dispatch", True, resp.get("latency_ms", 0),
+                          tool_name=_kb_skill, chat_id=chat_id)
+                return {
+                    "ok": True,
+                    "path": "llm_tool_rescued",
+                    "card": _r.get("card", _empty_card("（skill 无卡片）")),
+                    "tool_calls": [{"name": _kb_skill, "args": _args, "source": "keyword_fallback"}],
+                    "raw": _r.get("raw", {}),
+                    "error": None,
+                    "uses_llm": _r.get("uses_llm", False),
+                }
         # v12.A.1: freeform 路径把 date 拼到 messages (治 LLM hallucinate "周五" → 6-12)
         if parsed_date:
             messages = list(messages)

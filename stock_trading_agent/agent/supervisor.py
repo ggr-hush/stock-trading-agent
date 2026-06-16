@@ -221,6 +221,18 @@ def _run_supervisor() -> None:
     """
     init_account()
     _write_pid()
+
+    # v12.A.4.c: 启动预热 (拉 stock_basic + daily 缓存, ~5-10s)
+    try:
+        from stock_trading_agent.engine import cache as _cache
+        warm = _cache.warm_up()
+        log.info("[supervisor] 缓存预热: stock_basic=%s daily=%s errors=%d",
+                 warm.get("stock_basic"), warm.get("daily"), len(warm.get("errors", [])))
+        for e in warm.get("errors", []):
+            log.warning("[supervisor] warm_up: %s", e)
+    except Exception as e:
+        log.warning("[supervisor] 缓存预热失败 (不阻塞启动): %s", e)
+
     caught = catch_up_stages()
     if caught:
         log.info("[supervisor] catch-up 已补跑: %s", caught)

@@ -27,10 +27,27 @@ def test_is_trading_day_weekday_no_holiday() -> None:
 
 
 def test_is_trading_day_holidays_blocked() -> None:
+    """v12.A.4.c: 走 Tushare trade_cal, mock Tushare trade_cal 返真实 holiday 数据"""
+    from unittest.mock import patch, MagicMock
+    import pandas as pd
     from stock_trading_agent.engine.data_fetcher import is_trading_day
-    assert is_trading_day(date(2026, 10, 1)) is False, "国庆应返 False"
-    assert is_trading_day(date(2026, 2, 17)) is False, "春节应返 False"
-    assert is_trading_day(date(2026, 6, 19)) is False, "端午应返 False"
+    # 模拟 Tushare 返的 trade_cal 数据 (is_open=0 是节假日)
+    fake_trade_cal = pd.DataFrame({
+        "cal_date": ["20261001", "20260217", "20260619"],  # 国庆/春节/端午
+        "is_open": [0, 0, 0],
+    })
+    # _load_trade_cal 会调 _safe_df 内部调 tushare trade_cal, 返 DataFrame
+    # mock _safe_df 返 fake (因为 _load_trade_cal 内部 from ... import _safe_df)
+    with patch("stock_trading_agent.engine.tushare_client._safe_df", return_value=fake_trade_cal):
+        # 还得 mock 缓存写入, 用 _TRADE_CAL_CACHE_DIR 临时目录
+        import tempfile
+        from pathlib import Path
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("stock_trading_agent.engine.data_fetcher._TRADE_CAL_CACHE_DIR", Path(tmpdir)):
+                # 第一次调用会调 _safe_df, 写缓存, 返 set
+                assert is_trading_day(date(2026, 10, 1)) is False, "国庆应返 False"
+                assert is_trading_day(date(2026, 2, 17)) is False, "春节应返 False"
+                assert is_trading_day(date(2026, 6, 19)) is False, "端午应返 False"
     print("  PASS test_is_trading_day_holidays_blocked")
 
 
@@ -54,7 +71,7 @@ def test_explain_pick_fallback_to_realtime_quote() -> None:
                       return_value={"code": "603063", "name": "禾望电气",
                                     "price": 32.5, "chg_pct": 1.2,
                                     "turnover": 2.5, "mktcap_yi": 80,
-                                    "source": "东方财富实时"}), \
+                                    "source": "tushare"}), \
          patch("stock_trading_agent.llm.reasoner.answer_question",
                return_value="禾望电气今天涨 1.2%, 板块光伏设备活跃, 走势温和."):
         mock_db.return_value.execute.return_value.fetchone.return_value = None
@@ -62,7 +79,7 @@ def test_explain_pick_fallback_to_realtime_quote() -> None:
 
     assert result["source"] == "realtime"
     assert result["name"] == "禾望电气"
-    assert "[数据源: 东方财富实时]" in result["explanation"]
+    assert "[数据源: Tushare" in result["explanation"]
     print("  PASS test_explain_pick_fallback_to_realtime_quote")
 
 
@@ -95,15 +112,18 @@ def test_stage_post_market_counts_filled() -> None:
     conn.row_factory = sqlite3.Row
     conn.execute("CREATE TABLE picks(pick_date TEXT, code TEXT, name TEXT, price REAL, chg_pct REAL, score REAL, sector TEXT, plan_used TEXT)")
     conn.execute("CREATE TABLE paper_positions(pick_date TEXT, code TEXT, name TEXT, open_price REAL, shares REAL, status TEXT)")
+    # v12.A.4.c: 改用今天日期 (代码里 _date.today().isoformat() 决定 WHERE pick_date)
+    from datetime import date as _date
+    today = _date.today().isoformat()
     for row in [
-        ("2026-06-13", "600519", "茅台", 1500, 1.0, 80, "白酒", "A"),
-        ("2026-06-13", "600036", "招行", 35, 0.5, 75, "银行", "A"),
-        ("2026-06-13", "002594", "比亚迪", 250, 2.0, 78, "汽车", "B"),
+        (today, "600519", "茅台", 1500, 1.0, 80, "白酒", "A"),
+        (today, "600036", "招行", 35, 0.5, 75, "银行", "A"),
+        (today, "002594", "比亚迪", 250, 2.0, 78, "汽车", "B"),
     ]:
         conn.execute("INSERT INTO picks VALUES (?,?,?,?,?,?,?,?)", row)
     for row in [
-        ("2026-06-13", "600519", "茅台", 1499, 100, "open"),
-        ("2026-06-13", "600036", "招行", 35, 1000, "open"),
+        (today, "600519", "茅台", 1499, 100, "open"),
+        (today, "600036", "招行", 35, 1000, "open"),
     ]:
         conn.execute("INSERT INTO paper_positions VALUES (?,?,?,?,?,?)", row)
     conn.commit()

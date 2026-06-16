@@ -55,13 +55,13 @@ def test_run_get_stock_quote_with_kline_data() -> None:
         "open": 33.10, "close": 33.45, "high": 33.80, "low": 33.10,
         "chg_pct": 0.50, "chg_amt": 0.17,
         "volume": 12345678, "amount_yi": 1.23, "amplitude": 2.10,
-        "turnover": 2.15, "source": "东方财富K线",
+        "turnover": 2.15, "source": "tushare",
     }
     with patch("stock_trading_agent.engine.data_fetcher.fetch_stock_kline", return_value=fake_kline):
         r = _run_get_stock_quote({"code": "603063", "date": "2026-06-12"})
     assert r["close"] == 33.45
     assert r["chg_pct"] == 0.50
-    assert r["source"] == "东方财富K线"
+    assert r["source"] == "tushare"
     assert r["date"] == "2026-06-12"
 
 
@@ -165,7 +165,7 @@ def test_explain_pick_falls_back_to_kline_when_date_given() -> None:
         "code": "999999", "name": "测试股", "date": "2026-06-12",
         "open": 10.0, "close": 10.5, "high": 11.0, "low": 9.8,
         "chg_pct": 5.0, "chg_amt": 0.5, "turnover": 1.5, "amount_yi": 0.5,
-        "amplitude": 12.0, "source": "东方财富K线",
+        "amplitude": 12.0, "source": "tushare",
     }
     with patch("stock_trading_agent.engine.data_fetcher.fetch_stock_kline", return_value=fake_kline), \
          patch.object(reasoner, "answer_question", return_value="这是一只测试股"):

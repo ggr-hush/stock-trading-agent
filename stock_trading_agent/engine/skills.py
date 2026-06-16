@@ -299,14 +299,20 @@ def _run_get_market_env(args: dict[str, Any]) -> dict[str, Any]:
         from .data_fetcher import get_market_env as _fetch_env, load_config as _load_cfg
         cfg = _load_cfg()
         env = _fetch_env(cfg)  # v12.A.3: 我之前改 evidence 误删了, 补回
+        # v12.A.4: 加 5 档 market regime 分类
+        from .market_regime import classify_regime
+        regime_info = classify_regime(env)
         return {
             "env_score": env.get("env_score"),
             "env_level": env.get("env_level"),
             "date": today.isoformat(),
             "source": "realtime",
+            "regime": regime_info["regime"],
+            "regime_zh": regime_info["label_zh"],
+            "regime_reasons": regime_info["reasons"],
             "evidence": build_evidence_from_sql(
-                "东方财富 push2 实时大盘", 1,
-                sample=f"env_score={env.get('env_score')} level={env.get('env_level')}",
+                "Tushare index_daily 大盘环境", 1,
+                sample=f"env_score={env.get('env_score')} level={env.get('env_level')} regime={regime_info['regime']}",
             ),
         }
     except Exception as e:  # noqa: BLE001
@@ -316,6 +322,9 @@ def _run_get_market_env(args: dict[str, Any]) -> dict[str, Any]:
             "env_level": "数据源不可用",
             "date": today.isoformat(),
             "source": "failed",
+            "regime": "Choppy",
+            "regime_zh": "震荡 (数据缺失)",
+            "regime_reasons": ["数据源不可用, 默认震荡"],
             "evidence": [],
         }
 
@@ -402,7 +411,7 @@ def _run_get_stock_quote(args: dict[str, Any]) -> dict[str, Any]:
         kline["requested_date"] = target_date.isoformat()
     # v12.A.3: evidence 字段
     kline["evidence"] = build_evidence_from_sql(
-        f"东方财富 push2his.kline ({fetched_date or target_date})", 1,
+        f"Tushare daily K 线 ({fetched_date or target_date})", 2,
         sample=f"{kline.get('name', code)} 收盘 {kline.get('close')} 涨跌 {kline.get('chg_pct')}%",
     )
     return kline
@@ -414,7 +423,7 @@ def _render_stock_quote_card(result: dict[str, Any]) -> dict[str, Any]:
     name = result.get("name") or code
     src = result.get("source", "kline")
     src_emoji = {
-        "kline": "📈", "东方财富K线": "📈",
+        "kline": "📈", "tushare": "📈",
         "future": "⏳", "bad_date": "❓", "bad_code": "❓", "empty": "⚠️",
     }.get(src, "📊")
     if src in ("future", "bad_date", "bad_code", "empty"):
@@ -540,7 +549,7 @@ def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
             turnover = kline.get("turnover")
             amount_yi = kline.get("amount_yi")
             k_date = kline.get("date")
-            data_tag = f"[数据源: 东方财富K线 · {k_date}]"
+            data_tag = f"[数据源: Tushare K线 · daily · {k_date}]"
             facts = f"{name}({code}) {k_date} 收盘 {price}元, 涨跌 {chg}% ({chg_amt:+.2f}元), 换手 {turnover}%, 成交额 {amount_yi}亿"
         else:
             # 实时数据
@@ -548,7 +557,7 @@ def _run_explain_pick(args: dict[str, Any]) -> dict[str, Any]:
             chg = kline.get("chg_pct")
             turnover = kline.get("turnover")
             mktcap = kline.get("mktcap_yi")
-            data_tag = "[数据源: 东方财富实时]"
+            data_tag = "[数据源: Tushare K 线 · daily + daily_basic]"
             facts = f"{name}({code}) 最新价 {price}, 今日 {chg}%, 换手 {turnover}%, 总市值 {mktcap}亿"
         explanation = answer_question(
             question=f"用大白话一句话说说 {facts}, 给小白用户看 (≤ 100 字)",
@@ -732,6 +741,200 @@ def _render_stock_lifecycle_card(result: dict[str, Any]) -> dict[str, Any]:
     }}
 
 
+def _run_get_daily_decision(args: dict[str, Any]) -> dict[str, Any]:
+    """v12.A.4: 综合市场状态 + 选股候选 → 当日决策卡片"""
+    from .data_fetcher import get_market_env, load_config
+    from .market_regime import classify_regime
+    from .decision_engine import build_daily_decision
+    from datetime import date as _date
+    cfg = load_config()
+    env = get_market_env(cfg)
+    regime_info = classify_regime(env)
+    candidate_count = 0
+    try:
+        from .paper_trader import get_db
+        conn = get_db()
+        today = _date.today().isoformat()
+        row = conn.execute(
+            "SELECT COUNT(*) AS c FROM picks WHERE pick_date = ?", (today,)
+        ).fetchone()
+        if row:
+            candidate_count = row["c"]
+    except Exception as e:  # noqa: BLE001
+        log.debug("get_daily_decision 读 picks 失败: %s", e)
+    decision = build_daily_decision(regime_info, candidate_count=candidate_count)
+    return {
+        "regime": regime_info["regime"],
+        "regime_zh": regime_info["label_zh"],
+        "env_score": env.get("env_score"),
+        "candidate_count": candidate_count,
+        "decision": decision,
+    }
+
+
+def _render_decision_card(result: dict[str, Any]) -> dict[str, Any]:
+    """v12.A.4: 决策卡片 (regime + mode + 仓位 + 理由)"""
+    regime = result.get("regime", "?")
+    regime_zh = result.get("regime_zh", "?")
+    score = result.get("env_score")
+    d = result.get("decision", {})
+    mode = d.get("decisionMode", "?")
+    mode_zh = d.get("mode_zh", "?")
+    pos_min = d.get("positionMin", 0)
+    pos_max = d.get("positionMax", 0)
+    cand = result.get("candidate_count", 0)
+    score_str = f"{score}" if score is not None else "?"
+    regime_emoji = {
+        "Panic": "🔴", "RiskOff": "🟠", "Choppy": "⚪",
+        "Recovery": "🟡", "RiskOn": "🟢",
+    }.get(regime, "⚪")
+    mode_emoji = {
+        "WAIT": "🚫", "DEFENSIVE_OBSERVE": "🛡️",
+        "WATCH": "👀", "PROBE": "🎯",
+    }.get(mode, "❓")
+    lines = []
+    # v12.A.4.b: 数据缺失时顶部加 sentinel 提示
+    if score is None or (score == 50 and regime == "Choppy" and "数据缺失" in regime_zh):
+        lines.append("⚠️ **指数接口暂时不可用** (qt.gtimg.cn + hq.sinajs.cn 都失败), 决策基于默认值, 建议人工判断")
+        lines.append("")
+    lines = lines + [
+        f"{regime_emoji} **市场状态: {regime_zh}** (env={score_str}, 候选 {cand} 只)",
+        f"{mode_emoji} **决策模式: {mode_zh}**",
+        f"💰 **建议仓位: {pos_min:.0%} - {pos_max:.0%}**",
+        "",
+        "**关键理由:**",
+    ]
+    for r in d.get("keyReasons", []):
+        lines.append(f"• {r}")
+    lines.append("")
+    lines.append("**允许动作:**")
+    for a in d.get("allowedActions", []):
+        lines.append(f"  ✅ {a}")
+    lines.append("")
+    lines.append("**禁止动作:**")
+    for f_ in d.get("forbiddenActions", []):
+        lines.append(f"  ❌ {f_}")
+    if d.get("switchConditions"):
+        lines.append("")
+        lines.append("**切换条件:**")
+        for s_ in d.get("switchConditions", [])[:3]:
+            lines.append(f"  🔄 {s_}")
+    return {"msg_type": "interactive", "content": {
+        "tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}
+    }}
+
+
+def _run_add_review(args: dict[str, Any]) -> dict[str, Any]:
+    """v12.A.4: 写一条复盘 (自然语言解析 + 落库 + 写 REVIEWED fact)"""
+    from . import reviews as _reviews
+    text: str = (args or {}).get("text", "").strip()
+    if not text:
+        return {"ok": False, "error": "（请提供复盘内容, 例: '加复盘: 002063 止盈 2.5% 早盘冲高'）"}
+    parsed = _reviews.parse_natural_review(text)
+    if not parsed:
+        return {"ok": False, "error": "（未识别复盘指令, 请用 '加复盘: 代码 动作 备注' 格式）"}
+    if "error" in parsed:
+        return {"ok": False, "error": parsed["error"]}
+    rid = _reviews.add_review(
+        date=parsed["date"],
+        stock_code=parsed["stock_code"],
+        action_taken=parsed.get("action_taken", False),
+        result=parsed.get("result", ""),
+        summary=parsed.get("summary", ""),
+        tags=parsed.get("tags", []),
+    )
+    # 写 REVIEWED temporal fact
+    try:
+        from .temporal_facts import record
+        record(
+            subject=parsed["stock_code"],
+            predicate="REVIEWED",
+            object_=f"review:{rid}",
+            claim=f"{parsed.get('result', '')} {parsed.get('summary', '')}".strip(),
+            source="user_review",
+            tags=",".join(parsed.get("tags", [])),
+        )
+    except Exception as e:  # noqa: BLE001
+        log.warning("add_review 写 REVIEWED fact 失败: %s", e)
+    return {
+        "ok": True,
+        "review_id": rid,
+        "date": parsed["date"],
+        "stock_code": parsed["stock_code"],
+        "action_taken": parsed.get("action_taken", False),
+        "result": parsed.get("result", ""),
+        "summary": parsed.get("summary", ""),
+        "tags": parsed.get("tags", []),
+    }
+
+
+def _run_query_reviews(args: dict[str, Any]) -> dict[str, Any]:
+    """v12.A.4: 查复盘 (按 date/code/tag/action_taken 过滤)"""
+    from . import reviews as _reviews
+    date = (args or {}).get("date")
+    stock_code = (args or {}).get("stock_code")
+    tag = (args or {}).get("tag")
+    action_taken = (args or {}).get("action_taken")
+    if isinstance(action_taken, str):
+        action_taken = action_taken.lower() in ("true", "1", "yes")
+    limit = int((args or {}).get("limit", 20))
+    items = _reviews.query_reviews(
+        date=date, stock_code=stock_code, tag=tag,
+        action_taken=action_taken, limit=limit,
+    )
+    return {
+        "count": len(items),
+        "items": items,
+        "filters": {
+            "date": date, "stock_code": stock_code, "tag": tag,
+            "action_taken": action_taken, "limit": limit,
+        },
+    }
+
+
+def _render_reviews_card(result: dict[str, Any]) -> dict[str, Any]:
+    """v12.A.4: 复盘列表卡片"""
+    items = result.get("items", [])
+    if result.get("ok") is False:
+        return {"msg_type": "text", "content": {"text": f"❌ {result.get('error', '失败')}"}}
+    # add_review 返 ok 字段
+    if result.get("ok") and "review_id" in result:
+        rid = result["review_id"]
+        code = result["stock_code"]
+        result_pct = result.get("result", "")
+        tags = result.get("tags", [])
+        action_icon = "✅" if result.get("action_taken") else "👀"
+        text = (
+            f"{action_icon} 复盘已记录 #{rid}\n"
+            f"  代码: {code}\n"
+            f"  结果: {result_pct or '(无)'}\n"
+            f"  标签: {' '.join(f'#{t}' for t in tags) or '(无)'}\n"
+            f"  摘要: {result.get('summary', '')[:80]}"
+        )
+        return {"msg_type": "text", "content": {"text": text}}
+    # query_reviews 返 list
+    if not items:
+        return {"msg_type": "text", "content": {"text": "📭 无匹配复盘"}}
+    lines = [f"📋 **复盘列表** (共 {len(items)} 条)"]
+    for r in items[:10]:
+        rid = r.get("id", "?")
+        code = r.get("stock_code", "?")
+        name = r.get("stock_name") or ""
+        action = "✅" if r.get("action_taken") else "👀"
+        result_pct = r.get("result", "")
+        tags = r.get("tags", [])
+        date = r.get("date", "?")
+        summary = (r.get("summary", "") or "")[:60]
+        tags_str = " ".join(f"#{t}" for t in tags[:3])
+        lines.append(
+            f"{action} `{date}` **{code}** {name} {result_pct} {tags_str}\n"
+            f"  {summary}"
+        )
+    return {"msg_type": "interactive", "content": {
+        "tag": "div", "text": {"tag": "lark_md", "content": "\n".join(lines)}
+    }}
+
+
 def _render_backtest_card(result: dict[str, Any]) -> dict[str, Any]:
     if "error" in result:
         return {"msg_type": "text", "content": {"text": f"回测失败: {result['error']}"}}
@@ -846,7 +1049,7 @@ SKILL_REGISTRY: dict[str, Skill] = {
             "type": "function",
             "function": {
                 "name": "get_stock_quote",
-                "description": "查询个股某日 K 线行情 (东方财富 push2his.kline)。"
+                "description": "查询个股某日 K 线行情 (Tushare daily + daily_basic, v12.A.4.c 起)。"
                                " 必须传 code (6 位); 可选 date=YYYY-MM-DD (默认今天)。"
                                " 治 '禾望电气周五行情' 类: 周五=6-12 时返 6-12 收盘价, 不幻觉。",
                 "parameters": {
@@ -973,6 +1176,71 @@ SKILL_REGISTRY: dict[str, Skill] = {
         run=_run_get_stock_lifecycle,
         render_to_card=_render_stock_lifecycle_card,
     ),
+    "get_daily_decision": Skill(
+        name="get_daily_decision",
+        description="v12.A.4: 综合市场状态 + 选股候选 → 当日决策 (regime + mode + 仓位 + 理由)。",
+        uses_llm=False,
+        schema={
+            "type": "function",
+            "function": {
+                "name": "get_daily_decision",
+                "description": "v12.A.4: 仿 felix 决策引擎. 返 5 档市场状态 + 4 档决策模式 + 仓位区间 + 允许/禁止动作",
+                "parameters": {
+                    "type": "object",
+                    "properties": {},
+                    "required": [],
+                },
+            },
+        },
+        run=_run_get_daily_decision,
+        render_to_card=_render_decision_card,
+    ),
+    "add_review": Skill(
+        name="add_review",
+        description="v12.A.4: 写一条复盘 (自然语言: '加复盘: 002063 止盈 2.5% 早盘冲高')。",
+        uses_llm=False,
+        schema={
+            "type": "function",
+            "function": {
+                "name": "add_review",
+                "description": "加复盘记录, 解析自然语言 → 落 reviews 表 + 写 REVIEWED temporal fact",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "text": {"type": "string", "description": "复盘文本, 格式: '加复盘: 代码 动作 备注'"},
+                    },
+                    "required": ["text"],
+                },
+            },
+        },
+        run=_run_add_review,
+        render_to_card=_render_reviews_card,
+    ),
+    "query_reviews": Skill(
+        name="query_reviews",
+        description="v12.A.4: 按 (date/code/tag) 查复盘列表。",
+        uses_llm=False,
+        schema={
+            "type": "function",
+            "function": {
+                "name": "query_reviews",
+                "description": "查复盘 (按 date/stock_code/tag/action_taken 过滤)",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "date": {"type": "string", "description": "复盘日期 YYYY-MM-DD"},
+                        "stock_code": {"type": "string", "description": "6 位股票代码"},
+                        "tag": {"type": "string", "description": "标签 (如 '止盈' / '题材退潮')"},
+                        "action_taken": {"type": "boolean", "description": "是否实操过 (默认全部)"},
+                        "limit": {"type": "integer", "description": "返回条数, 默认 20"},
+                    },
+                    "required": [],
+                },
+            },
+        },
+        run=_run_query_reviews,
+        render_to_card=_render_reviews_card,
+    ),
 }
 
 
@@ -991,6 +1259,11 @@ _KEYWORD_FALLBACK: list[tuple[list[str], str]] = [
     (["回测", "backtest", "复盘"], "backtest"),
     # v12.A.3: 时序账本
     (["时序", "生命周期", "lifecycle", "历史决策", "这票历史"], "get_stock_lifecycle"),
+    # v12.A.4: 决策引擎
+    (["今天能买", "今日决策", "今日操作", "今天操作", "能不能买", "操作建议", "仓位建议", "今天怎么办"], "get_daily_decision"),
+    # v12.A.4: 复盘 (关键词降级)
+    (["加复盘", "记复盘", "复盘记录"], "add_review"),
+    (["我的复盘", "今日复盘", "历史复盘", "查复盘"], "query_reviews"),
 ]
 
 
@@ -1027,6 +1300,17 @@ def _parse_relative_date(text: str) -> str | None:
     if m2:
         try:
             return date(today.year, int(m2.group(1)), int(m2.group(2))).isoformat()
+        except ValueError:
+            return None
+    # 中文日期: 6月16日 / 6月16号 / 06月16日
+    m3 = re.search(r"(\d{1,2})月(\d{1,2})[日号]", t)
+    if m3:
+        try:
+            d = date(today.year, int(m3.group(1)), int(m3.group(2)))
+            # 未来日期 → 减一年 (用户大概率说去年)
+            if d > today:
+                d = date(today.year - 1, int(m3.group(1)), int(m3.group(2)))
+            return d.isoformat()
         except ValueError:
             return None
 
